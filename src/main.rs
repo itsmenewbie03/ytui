@@ -24,6 +24,7 @@ pub mod scraper;
 
 const NAV_ITEMS: [&str; 2] = ["Home", "Search"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 type PlayRequestResult = innertube_rs::error::Result<(QueueSource, usize, String)>;
 
 fn main() -> Result<()> {
@@ -62,6 +63,7 @@ struct App {
     search_state: ListState,
     search_complete: bool,
     search_error: Option<String>,
+    animation_started: Instant,
 }
 
 impl App {
@@ -95,6 +97,7 @@ impl App {
             search_state: ListState::default(),
             search_complete: false,
             search_error: None,
+            animation_started: Instant::now(),
         }
     }
 
@@ -259,45 +262,50 @@ impl App {
 
     fn render_main_content(&mut self, frame: &mut Frame, area: Rect) {
         let section = NAV_ITEMS[self.nav.selected().unwrap_or_default()];
-        let block = Block::default()
-            .title(format!(" {section} "))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(if self.focus == Focus::Content {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default()
-            })
-            .padding(Padding::proportional(1));
-
         if section == "Search" {
-            self.render_search(frame, area, block);
+            self.render_search(frame, area);
         } else {
-            self.render_home(frame, area, block);
+            self.render_home(frame, area);
         }
     }
 
-    fn render_home(&mut self, frame: &mut Frame, area: Rect, block: Block) {
+    fn render_home(&mut self, frame: &mut Frame, area: Rect) {
         if self.home_shelves.is_empty() {
-            let message = if let Some(error) = &self.home_error {
-                error.as_str()
+            let (message, loading) = if let Some(error) = &self.home_error {
+                (error.clone(), false)
             } else if self.init_receiver.is_some() {
-                "Initializing YouTube Music..."
+                ("Initializing YouTube Music...".to_owned(), true)
             } else if self.home_receiver.is_some() {
-                "Loading your home feed..."
+                ("Loading your home feed...".to_owned(), true)
             } else {
-                "No playable tracks were found in the home feed."
+                (
+                    "No playable tracks were found in the home feed.".to_owned(),
+                    false,
+                )
             };
-            frame.render_widget(Paragraph::new(message).block(block), area);
+            let message = if loading {
+                format!("{}  {message}", self.spinner_frame())
+            } else {
+                message
+            };
+            let message_area = Rect::new(area.x, area.y + area.height / 2, area.width, 1);
+            frame.render_widget(
+                Paragraph::new(message)
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(if loading {
+                        Color::LightCyan
+                    } else {
+                        Color::DarkGray
+                    })),
+                message_area,
+            );
             return;
         }
 
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
         let [shelf_tabs, list_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(1)])
-            .areas(inner);
+            .areas(area);
         let labels = self
             .home_shelves
             .iter()
@@ -533,6 +541,11 @@ impl App {
         }
     }
 
+    fn spinner_frame(&self) -> &'static str {
+        let frame = (self.animation_started.elapsed().as_millis() / 100) as usize;
+        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+    }
+
     fn render_up_next(&self, frame: &mut Frame, area: Rect) {
         let Some(source) = self.playback.source else {
             frame.render_widget(Paragraph::new("The queue is empty."), area);
@@ -575,14 +588,11 @@ impl App {
         );
     }
 
-    fn render_search(&mut self, frame: &mut Frame, area: ratatui::layout::Rect, block: Block) {
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
+    fn render_search(&mut self, frame: &mut Frame, area: Rect) {
         let [query_area, results_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(1)])
-            .areas(inner);
+            .areas(area);
         let query = if self.search_query.is_empty() && !self.search_editing {
             "Press Enter to type a query".to_owned()
         } else if self.search_editing {
@@ -1459,7 +1469,8 @@ fn wrap_text(message: &str, max_width: usize) -> Vec<String> {
 }
 
 fn home_shelves(feed: MusicHomeFeed) -> Vec<HomeShelf> {
-    feed.shelves
+    let mut shelves = feed
+        .shelves
         .into_iter()
         .map(|shelf| {
             let mut items = shelf
@@ -1502,7 +1513,15 @@ fn home_shelves(feed: MusicHomeFeed) -> Vec<HomeShelf> {
                 items,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(index) = shelves
+        .iter()
+        .position(|shelf| shelf.title.eq_ignore_ascii_case("Quick picks"))
+    {
+        let quick_picks = shelves.remove(index);
+        shelves.insert(0, quick_picks);
+    }
+    shelves
 }
 
 fn format_time(seconds: f64) -> String {

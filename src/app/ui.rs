@@ -7,10 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{
-        Block, BorderType, Borders, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph,
-        Wrap,
-    },
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Padding, Paragraph, Wrap},
 };
 
 impl App {
@@ -23,7 +20,7 @@ impl App {
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
-        let mini_height = u16::from(self.playback.track.is_some()) * 4;
+        let mini_height = u16::from(self.playback.track.is_some()) * 6;
         let [body, mini_player, help] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -171,39 +168,38 @@ impl App {
         let Some(track) = &self.playback.track else {
             return;
         };
+        let block = Block::default()
+            .title(" Now playing ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         let [progress_area, controls_area] = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(3)])
-            .areas(area);
-        frame.render_widget(
-            LineGauge::default()
-                .ratio(self.playback_ratio())
-                .filled_style(Style::default().fg(Color::Red))
-                .unfilled_style(Style::default().fg(Color::DarkGray))
-                .label(""),
-            progress_area,
-        );
-        let strip_style = Style::default().fg(Color::Gray).bg(Color::Rgb(32, 33, 36));
-        frame.render_widget(Block::default().style(strip_style), controls_area);
+            .constraints([Constraint::Length(2), Constraint::Length(2)])
+            .areas(inner);
+        render_waveform_progress(frame, progress_area, self.playback_ratio(), &track.video_id);
+        let strip_style = Style::default().fg(Color::Gray);
         let [transport_area, track_area, time_area, actions_area] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(18),
-                Constraint::Min(28),
                 Constraint::Length(16),
-                Constraint::Length(25),
+                Constraint::Min(28),
+                Constraint::Length(14),
+                Constraint::Length(22),
             ])
             .areas(controls_area);
         let play_icon = if matches!(self.playback.status, PlaybackStatus::Paused) {
-            "▶"
+            ""
         } else {
-            "Ⅱ"
+            ""
         };
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
                 Line::styled(
-                    format!("  ⏮    {play_icon}    ⏭"),
+                    format!(" 󰒮   {play_icon}   󰒭"),
                     strip_style.add_modifier(Modifier::BOLD),
                 ),
             ])
@@ -213,12 +209,11 @@ impl App {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    format!("♫  {}", track.title),
+                    track.title.clone(),
                     strip_style.add_modifier(Modifier::BOLD),
                 ),
-                Line::styled(track.artist.clone(), strip_style.fg(Color::DarkGray)),
                 Line::styled(
-                    self.playback.status.label(),
+                    format!("{}  ·  {}", track.artist, self.playback.status.label()),
                     strip_style.fg(Color::DarkGray),
                 ),
             ])
@@ -239,7 +234,7 @@ impl App {
             time_area,
         );
         frame.render_widget(
-            Paragraph::new(vec![Line::from(""), Line::from("↶ 10s    10s ↷    [P]")])
+            Paragraph::new(vec![Line::from(""), Line::from("[ -10s  +10s ]   P")])
                 .alignment(Alignment::Center)
                 .style(strip_style),
             actions_area,
@@ -404,7 +399,7 @@ impl App {
             .constraints([Constraint::Length(3), Constraint::Min(1)])
             .areas(area);
         let query = if self.search_query.is_empty() && !self.search_editing {
-            "Search YouTube Music...".to_owned()
+            "What do you want to listen to?".to_owned()
         } else if self.search_editing {
             format!("{}|", self.search_query)
         } else {
@@ -635,6 +630,38 @@ fn wrap_text(message: &str, max_width: usize) -> Vec<String> {
 fn format_time(seconds: f64) -> String {
     let seconds = seconds.max(0.0) as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn render_waveform_progress(frame: &mut Frame, area: Rect, ratio: f64, seed: &str) {
+    const TOP: [&str; 4] = ["⣀", "⣤", "⣶", "⣿"];
+    const BOTTOM: [&str; 4] = ["⠉", "⠛", "⠿", "⣿"];
+
+    if area.height < 2 || area.width == 0 {
+        return;
+    }
+
+    let completed = (f64::from(area.width) * ratio.clamp(0.0, 1.0)).round() as u16;
+    let mut state = seed.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+    });
+    let buffer = frame.buffer_mut();
+    for column in 0..area.width {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let level = (state % 4) as usize;
+        let style = Style::default().fg(if column < completed {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        });
+        buffer[(area.x + column, area.y)]
+            .set_symbol(TOP[level])
+            .set_style(style);
+        buffer[(area.x + column, area.y + 1)]
+            .set_symbol(BOTTOM[level])
+            .set_style(style);
+    }
 }
 
 fn render_bubble_tabs(frame: &mut Frame, area: Rect, labels: &[&str], selected: usize) {

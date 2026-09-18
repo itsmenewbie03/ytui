@@ -26,6 +26,7 @@ const NAV_ITEMS: [&str; 2] = ["Home", "Search"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 type PlayRequestResult = innertube_rs::error::Result<(QueueSource, usize, String)>;
+type SearchRequestResult = innertube_rs::error::Result<MusicSearchResults>;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -63,6 +64,7 @@ struct App {
     search_state: ListState,
     search_complete: bool,
     search_error: Option<String>,
+    search_receiver: Option<Receiver<SearchRequestResult>>,
     animation_started: Instant,
 }
 
@@ -97,6 +99,7 @@ impl App {
             search_state: ListState::default(),
             search_complete: false,
             search_error: None,
+            search_receiver: None,
             animation_started: Instant::now(),
         }
     }
@@ -105,6 +108,7 @@ impl App {
         loop {
             self.poll_initialization();
             self.poll_home();
+            self.poll_search();
             self.poll_play_request();
             self.poll_player_events();
             self.expire_notification();
@@ -116,7 +120,7 @@ impl App {
             {
                 if self.search_editing {
                     match key.code {
-                        KeyCode::Enter => self.submit_search(terminal)?,
+                        KeyCode::Enter => self.submit_search(),
                         KeyCode::Esc => self.search_editing = false,
                         KeyCode::Backspace => {
                             self.search_query.pop();
@@ -594,7 +598,7 @@ impl App {
             .constraints([Constraint::Length(3), Constraint::Min(1)])
             .areas(area);
         let query = if self.search_query.is_empty() && !self.search_editing {
-            "Press Enter to type a query".to_owned()
+            "Search YouTube Music...".to_owned()
         } else if self.search_editing {
             format!("{}|", self.search_query)
         } else {
@@ -608,7 +612,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(query).style(query_style).block(
                 Block::default()
-                    .title(" Query ")
+                    .title(" Search ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .padding(Padding::horizontal(1)),
@@ -616,10 +620,34 @@ impl App {
             query_area,
         );
 
-        if let Some(error) = &self.search_error {
+        if self.search_receiver.is_some() {
+            let loading_area = Rect::new(
+                results_area.x,
+                results_area.y + results_area.height / 2,
+                results_area.width,
+                1,
+            );
             frame.render_widget(
-                Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red)),
-                results_area,
+                Paragraph::new(format!(
+                    "{}  Searching YouTube Music...",
+                    self.spinner_frame()
+                ))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::LightCyan)),
+                loading_area,
+            );
+        } else if let Some(error) = &self.search_error {
+            let error_area = Rect::new(
+                results_area.x,
+                results_area.y + results_area.height / 2,
+                results_area.width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(error.as_str())
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::Red)),
+                error_area,
             );
         } else if !self.search_items.is_empty() {
             let [count_area, list_area] = Layout::default()
@@ -662,51 +690,95 @@ impl App {
                 &mut self.search_state,
             );
         } else if self.search_complete {
-            frame.render_widget(Paragraph::new("No results found."), results_area);
-        } else {
+            let empty_area = Rect::new(
+                results_area.x,
+                results_area.y + results_area.height / 2,
+                results_area.width,
+                1,
+            );
             frame.render_widget(
-                Paragraph::new("Search songs, videos, albums, artists, and playlists.")
+                Paragraph::new("No results found.")
+                    .alignment(Alignment::Center)
                     .style(Style::default().fg(Color::DarkGray)),
-                results_area,
+                empty_area,
+            );
+        } else {
+            let hint_area = Rect::new(
+                results_area.x,
+                results_area.y + results_area.height.saturating_sub(2) / 2,
+                results_area.width,
+                2,
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        "Find something to play",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Line::styled(
+                        "Songs, videos, albums, artists, and playlists",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+                .alignment(Alignment::Center),
+                hint_area,
             );
         }
     }
 
-    fn submit_search(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    fn submit_search(&mut self) {
         let query = self.search_query.trim().to_owned();
         if query.is_empty() {
-            return Ok(());
+            return;
         }
 
-        if self.ytmusic.is_none() {
+        let Some(ytmusic) = self.ytmusic.clone() else {
             let message = "YouTube Music is still initializing. Try again shortly.";
             self.search_error = Some(message.to_owned());
             self.notification = Some(Notification::warning("Not ready", message));
-            return Ok(());
-        }
+            return;
+        };
 
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(ytmusic.search(&query).await);
+        });
         self.search_editing = false;
-        self.search_error = Some("Searching...".to_owned());
-        terminal.draw(|frame| self.render(frame))?;
+        self.search_complete = false;
+        self.search_error = None;
+        self.search_receiver = Some(receiver);
+    }
 
-        let ytmusic = self.ytmusic.as_ref().expect("client checked above");
-        match self.runtime.block_on(ytmusic.search(&query)) {
-            Ok(results) => {
+    fn poll_search(&mut self) {
+        let Some(receiver) = &self.search_receiver else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(Ok(results)) => {
                 self.search_items = search_items(results);
                 self.search_state
                     .select((!self.search_items.is_empty()).then_some(0));
                 self.search_complete = true;
                 self.search_error = None;
+                self.search_receiver = None;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.search_items.clear();
                 self.search_state.select(None);
                 self.search_complete = true;
                 self.search_error = Some(format!("Search failed: {error}"));
+                self.search_receiver = None;
             }
+            Err(TryRecvError::Disconnected) => {
+                self.search_items.clear();
+                self.search_state.select(None);
+                self.search_complete = true;
+                self.search_error = Some("The search task stopped unexpectedly.".to_owned());
+                self.search_receiver = None;
+            }
+            Err(TryRecvError::Empty) => {}
         }
-
-        Ok(())
     }
 
     fn poll_initialization(&mut self) {

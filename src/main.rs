@@ -319,6 +319,7 @@ impl App {
 
         let shelf_window = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan));
         let shelf_content = shelf_window.inner(list_area);
         frame.render_widget(shelf_window, list_area);
@@ -455,6 +456,7 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan))
             .padding(Padding::proportional(1));
         let inner = block.inner(content);

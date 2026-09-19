@@ -39,11 +39,17 @@ impl App {
         let nav = List::new(NAV_ITEMS.map(ListItem::new))
             .block(
                 Block::default()
-                    .title(" ytui ")
+                    .title("  ytui ")
+                    .title_style(Style::default().bold())
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if self.focus == Focus::Nav {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    })),
             )
-            .highlight_symbol("> ")
+            .highlight_symbol(" ")
             .highlight_style(if self.focus == Focus::Nav {
                 Style::default()
                     .fg(Color::Cyan)
@@ -124,11 +130,16 @@ impl App {
             .iter()
             .map(|s| s.title.as_str())
             .collect::<Vec<_>>();
-        render_bubble_tabs(frame, shelf_tabs, &labels, self.home_shelf);
+        let is_focused = self.focus == Focus::Content;
+        render_bubble_tabs(frame, shelf_tabs, &labels, self.home_shelf, is_focused);
         let shelf_window = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(if is_focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }));
         let shelf_content = shelf_window.inner(list_area);
         frame.render_widget(shelf_window, list_area);
         let shelf = &self.home_shelves[self.home_shelf];
@@ -143,14 +154,18 @@ impl App {
         let selected = self.home_state.selected();
         let items = shelf.items.iter().enumerate().map(|(index, item)| {
             let is_selected = selected == Some(index);
-            let title_style = if is_selected {
+            let title_style = if is_selected && is_focused {
                 Style::default()
                     .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_selected {
+                Style::default()
+                    .fg(Color::Gray)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().add_modifier(Modifier::BOLD)
             };
-            let detail_style = if is_selected {
+            let detail_style = if is_selected && is_focused {
                 Style::default().fg(Color::LightCyan)
             } else {
                 Style::default().fg(Color::DarkGray)
@@ -162,7 +177,11 @@ impl App {
         });
         let list = List::new(items)
             .highlight_symbol("│ ")
-            .highlight_style(Style::default().fg(Color::Cyan))
+            .highlight_style(Style::default().fg(if is_focused {
+                Color::Cyan
+            } else {
+                Color::Gray
+            }))
             .repeat_highlight_symbol(true);
         frame.render_stateful_widget(list, shelf_content, &mut self.home_state);
     }
@@ -280,7 +299,7 @@ impl App {
             ])
             .areas(frame.area());
         self.render_player_summary(frame, summary);
-        render_bubble_tabs(frame, tabs, &PLAYER_TABS, self.player_tab);
+        render_bubble_tabs(frame, tabs, &PLAYER_TABS, self.player_tab, true);
         let block = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
@@ -446,15 +465,32 @@ impl App {
                     .title(" Search ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if self.search_editing {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }))
                     .padding(Padding::horizontal(1)),
             ),
             query_area,
         );
+        let results_focused = self.focus == Focus::Content && !self.search_editing;
+        let results_block = Block::default()
+            .title(" Results ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(if results_focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }));
+        let results_inner = results_block.inner(results_area);
+        frame.render_widget(results_block, results_area);
         if self.search_receiver.is_some() {
             let loading_area = Rect::new(
-                results_area.x,
-                results_area.y + results_area.height / 2,
-                results_area.width,
+                results_inner.x,
+                results_inner.y + results_inner.height / 2,
+                results_inner.width,
                 1,
             );
             frame.render_widget(
@@ -468,9 +504,9 @@ impl App {
             );
         } else if let Some(error) = &self.search_error {
             let error_area = Rect::new(
-                results_area.x,
-                results_area.y + results_area.height / 2,
-                results_area.width,
+                results_inner.x,
+                results_inner.y + results_inner.height / 2,
+                results_inner.width,
                 1,
             );
             frame.render_widget(
@@ -483,7 +519,7 @@ impl App {
             let [count_area, list_area] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
-                .areas(results_area);
+                .areas(results_inner);
             frame.render_widget(
                 Paragraph::new(format!("{} results", self.search_items.len()))
                     .alignment(Alignment::Right)
@@ -493,14 +529,18 @@ impl App {
             let selected = self.search_state.selected();
             let items = self.search_items.iter().enumerate().map(|(index, item)| {
                 let is_selected = selected == Some(index);
-                let title_style = if is_selected {
+                let title_style = if is_selected && results_focused {
                     Style::default()
                         .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_selected {
+                    Style::default()
+                        .fg(Color::Gray)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().add_modifier(Modifier::BOLD)
                 };
-                let detail_style = if is_selected {
+                let detail_style = if is_selected && results_focused {
                     Style::default().fg(Color::LightCyan)
                 } else {
                     Style::default().fg(Color::DarkGray)
@@ -513,16 +553,20 @@ impl App {
             frame.render_stateful_widget(
                 List::new(items)
                     .highlight_symbol("│ ")
-                    .highlight_style(Style::default().fg(Color::Cyan))
+                    .highlight_style(Style::default().fg(if results_focused {
+                        Color::Cyan
+                    } else {
+                        Color::Gray
+                    }))
                     .repeat_highlight_symbol(true),
                 list_area,
                 &mut self.search_state,
             );
         } else if self.search_complete {
             let empty_area = Rect::new(
-                results_area.x,
-                results_area.y + results_area.height / 2,
-                results_area.width,
+                results_inner.x,
+                results_inner.y + results_inner.height / 2,
+                results_inner.width,
                 1,
             );
             frame.render_widget(
@@ -533,9 +577,9 @@ impl App {
             );
         } else {
             let hint_area = Rect::new(
-                results_area.x,
-                results_area.y + results_area.height.saturating_sub(2) / 2,
-                results_area.width,
+                results_inner.x,
+                results_inner.y + results_inner.height.saturating_sub(2) / 2,
+                results_inner.width,
                 2,
             );
             frame.render_widget(
@@ -683,7 +727,13 @@ fn format_count(count: Option<u64>) -> String {
     }
 }
 
-fn render_bubble_tabs(frame: &mut Frame, area: Rect, labels: &[&str], selected: usize) {
+fn render_bubble_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    labels: &[&str],
+    selected: usize,
+    is_focused: bool,
+) {
     if labels.is_empty() || area.width < 4 || area.height < 3 {
         return;
     }
@@ -714,13 +764,22 @@ fn render_bubble_tabs(frame: &mut Frame, area: Rect, labels: &[&str], selected: 
         }
         let width = widths[index].min(area.right().saturating_sub(x));
         let tab_area = Rect::new(x, area.y, width, 3);
+        let border_color = if is_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan));
-        let style = if is_selected {
+            .border_style(Style::default().fg(border_color));
+        let style = if is_selected && is_focused {
             Style::default()
                 .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if is_selected {
+            Style::default()
+                .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -748,7 +807,7 @@ fn render_bubble_tabs(frame: &mut Frame, area: Rect, labels: &[&str], selected: 
             "┴"
         };
         let line = if is_selected { " " } else { "─" };
-        let border_style = Style::default().fg(Color::Cyan);
+        let border_style = Style::default().fg(border_color);
         let buffer = frame.buffer_mut();
         buffer[(x, bottom)].set_symbol(left).set_style(border_style);
         for column in x + 1..x + width - 1 {
@@ -762,7 +821,11 @@ fn render_bubble_tabs(frame: &mut Frame, area: Rect, labels: &[&str], selected: 
         x += width;
     }
     if x < area.right() {
-        let border_style = Style::default().fg(Color::Cyan);
+        let border_style = Style::default().fg(if is_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        });
         let buffer = frame.buffer_mut();
         for column in x..area.right() - 1 {
             buffer[(column, bottom)]

@@ -7,7 +7,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Padding, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph,
+        Wrap,
+    },
 };
 
 impl App {
@@ -20,7 +23,7 @@ impl App {
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
-        let mini_height = u16::from(self.playback.track.is_some()) * 6;
+        let mini_height = u16::from(self.playback.track.is_some()) * 5;
         let [body, mini_player, help] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -175,36 +178,35 @@ impl App {
             .border_style(Style::default().fg(Color::Cyan));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let [progress_area, controls_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Length(2)])
-            .areas(inner);
-        render_waveform_progress(frame, progress_area, self.playback_ratio(), &track.video_id);
         let strip_style = Style::default().fg(Color::Gray);
         let [transport_area, track_area, time_area, actions_area] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(16),
+                Constraint::Length(25),
                 Constraint::Min(28),
-                Constraint::Length(14),
+                Constraint::Length(42),
                 Constraint::Length(22),
             ])
-            .areas(controls_area);
+            .areas(inner);
         let play_icon = if matches!(self.playback.status, PlaybackStatus::Paused) {
             ""
         } else {
             ""
         };
+        let control_style = strip_style
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+        let transport_row = Rect::new(
+            transport_area.x,
+            transport_area.y + transport_area.height / 2,
+            transport_area.width,
+            1,
+        );
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::styled(
-                    format!(" 󰒮   {play_icon}   󰒭"),
-                    strip_style.add_modifier(Modifier::BOLD),
-                ),
-            ])
-            .style(strip_style),
-            transport_area,
+            Paragraph::new(Line::styled(format!("󰒮   {play_icon}   󰒭"), control_style))
+                .alignment(Alignment::Center)
+                .style(strip_style),
+            transport_row,
         );
         frame.render_widget(
             Paragraph::new(vec![
@@ -212,32 +214,58 @@ impl App {
                     track.title.clone(),
                     strip_style.add_modifier(Modifier::BOLD),
                 ),
+                Line::styled(track.artist.clone(), strip_style.fg(Color::DarkGray)),
                 Line::styled(
-                    format!("{}  ·  {}", track.artist, self.playback.status.label()),
+                    format!(
+                        "{} views  {} likes",
+                        format_count(track.views),
+                        format_count(track.likes)
+                    ),
                     strip_style.fg(Color::DarkGray),
                 ),
             ])
             .style(strip_style),
             track_area,
         );
+        let progress_row = Rect::new(
+            time_area.x,
+            time_area.y + time_area.height / 2,
+            time_area.width,
+            1,
+        );
+        let [gauge_area, timestamp_area] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(8), Constraint::Length(15)])
+            .areas(progress_row);
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(format!(
-                    "{} / {}",
-                    format_time(self.playback.position),
-                    format_time(self.playback.duration)
-                )),
-            ])
-            .alignment(Alignment::Center)
-            .style(strip_style.fg(Color::LightCyan)),
-            time_area,
+            LineGauge::default()
+                .ratio(self.playback_ratio())
+                .filled_style(Style::default().fg(Color::Cyan))
+                .unfilled_style(Style::default().fg(Color::DarkGray))
+                .label(""),
+            gauge_area,
         );
         frame.render_widget(
-            Paragraph::new(vec![Line::from(""), Line::from("[ -10s  +10s ]   P")])
+            Paragraph::new(format!(
+                "{} / {}",
+                format_time(self.playback.position),
+                format_time(self.playback.duration)
+            ))
+            .alignment(Alignment::Right)
+            .style(strip_style.fg(Color::LightCyan)),
+            timestamp_area,
+        );
+        let actions_row = Rect::new(
+            actions_area.x,
+            actions_area.y + actions_area.height / 2,
+            actions_area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new("[ -10s  +10s ]   P")
                 .alignment(Alignment::Center)
                 .style(strip_style),
-            actions_area,
+            actions_row,
         );
     }
 
@@ -374,6 +402,8 @@ impl App {
                         video_id: video_id.clone(),
                         title: item.title.clone(),
                         artist: item.detail.clone(),
+                        views: None,
+                        likes: None,
                     })
                 })
                 .collect(),
@@ -632,35 +662,24 @@ fn format_time(seconds: f64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
-fn render_waveform_progress(frame: &mut Frame, area: Rect, ratio: f64, seed: &str) {
-    const TOP: [&str; 4] = ["⣀", "⣤", "⣶", "⣿"];
-    const BOTTOM: [&str; 4] = ["⠉", "⠛", "⠿", "⣿"];
-
-    if area.height < 2 || area.width == 0 {
-        return;
-    }
-
-    let completed = (f64::from(area.width) * ratio.clamp(0.0, 1.0)).round() as u16;
-    let mut state = seed.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-    });
-    let buffer = frame.buffer_mut();
-    for column in 0..area.width {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let level = (state % 4) as usize;
-        let style = Style::default().fg(if column < completed {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        });
-        buffer[(area.x + column, area.y)]
-            .set_symbol(TOP[level])
-            .set_style(style);
-        buffer[(area.x + column, area.y + 1)]
-            .set_symbol(BOTTOM[level])
-            .set_style(style);
+fn format_count(count: Option<u64>) -> String {
+    let Some(count) = count else {
+        return "—".to_owned();
+    };
+    let (divisor, suffix) = if count >= 1_000_000_000 {
+        (1_000_000_000.0, "b")
+    } else if count >= 1_000_000 {
+        (1_000_000.0, "m")
+    } else if count >= 1_000 {
+        (1_000.0, "k")
+    } else {
+        return count.to_string();
+    };
+    let scaled = count as f64 / divisor;
+    if scaled >= 100.0 || scaled.fract() < 0.05 {
+        format!("{scaled:.0}{suffix}")
+    } else {
+        format!("{scaled:.1}{suffix}")
     }
 }
 
@@ -769,5 +788,13 @@ mod tests {
     #[test]
     fn wraps_notifications_on_word_boundaries() {
         assert_eq!(wrap_text("one two three", 7), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn humanizes_engagement_counts() {
+        assert_eq!(format_count(Some(999)), "999");
+        assert_eq!(format_count(Some(6_900)), "6.9k");
+        assert_eq!(format_count(Some(2_000_000)), "2m");
+        assert_eq!(format_count(None), "—");
     }
 }

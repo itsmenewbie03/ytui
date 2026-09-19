@@ -73,6 +73,8 @@ impl HomeEntry {
             video_id: video_id.clone(),
             title: title.clone(),
             artist: artist.clone(),
+            views: None,
+            likes: None,
         })
     }
 
@@ -111,6 +113,8 @@ pub(super) struct PlaybackTrack {
     pub(super) video_id: String,
     pub(super) title: String,
     pub(super) artist: String,
+    pub(super) views: Option<u64>,
+    pub(super) likes: Option<u64>,
 }
 
 #[derive(Default)]

@@ -23,7 +23,7 @@ impl App {
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
-        let mini_height = u16::from(self.playback.track.is_some()) * 4;
+        let mini_height = u16::from(self.playback.track.is_some()) * 5;
         let [body, mini_player, help] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -171,78 +171,101 @@ impl App {
         let Some(track) = &self.playback.track else {
             return;
         };
-        let [progress_area, controls_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(3)])
-            .areas(area);
-        frame.render_widget(
-            LineGauge::default()
-                .ratio(self.playback_ratio())
-                .filled_style(Style::default().fg(Color::Red))
-                .unfilled_style(Style::default().fg(Color::DarkGray))
-                .label(""),
-            progress_area,
-        );
-        let strip_style = Style::default().fg(Color::Gray).bg(Color::Rgb(32, 33, 36));
-        frame.render_widget(Block::default().style(strip_style), controls_area);
+        let block = Block::default()
+            .title(" Now playing ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let strip_style = Style::default().fg(Color::Gray);
         let [transport_area, track_area, time_area, actions_area] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(18),
-                Constraint::Min(28),
-                Constraint::Length(16),
                 Constraint::Length(25),
+                Constraint::Min(28),
+                Constraint::Length(42),
+                Constraint::Length(22),
             ])
-            .areas(controls_area);
+            .areas(inner);
         let play_icon = if matches!(self.playback.status, PlaybackStatus::Paused) {
-            "▶"
+            ""
         } else {
-            "Ⅱ"
+            ""
         };
+        let control_style = strip_style
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+        let transport_row = Rect::new(
+            transport_area.x,
+            transport_area.y + transport_area.height / 2,
+            transport_area.width,
+            1,
+        );
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::styled(
-                    format!("  ⏮    {play_icon}    ⏭"),
-                    strip_style.add_modifier(Modifier::BOLD),
-                ),
-            ])
-            .style(strip_style),
-            transport_area,
+            Paragraph::new(Line::styled(format!("󰒮   {play_icon}   󰒭"), control_style))
+                .alignment(Alignment::Center)
+                .style(strip_style),
+            transport_row,
         );
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    format!("♫  {}", track.title),
+                    track.title.clone(),
                     strip_style.add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(track.artist.clone(), strip_style.fg(Color::DarkGray)),
                 Line::styled(
-                    self.playback.status.label(),
+                    format!(
+                        "{} views  {} likes",
+                        format_count(track.views),
+                        format_count(track.likes)
+                    ),
                     strip_style.fg(Color::DarkGray),
                 ),
             ])
             .style(strip_style),
             track_area,
         );
+        let progress_row = Rect::new(
+            time_area.x,
+            time_area.y + time_area.height / 2,
+            time_area.width,
+            1,
+        );
+        let [gauge_area, timestamp_area] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(8), Constraint::Length(15)])
+            .areas(progress_row);
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(format!(
-                    "{} / {}",
-                    format_time(self.playback.position),
-                    format_time(self.playback.duration)
-                )),
-            ])
-            .alignment(Alignment::Center)
-            .style(strip_style.fg(Color::LightCyan)),
-            time_area,
+            LineGauge::default()
+                .ratio(self.playback_ratio())
+                .filled_style(Style::default().fg(Color::Cyan))
+                .unfilled_style(Style::default().fg(Color::DarkGray))
+                .label(""),
+            gauge_area,
         );
         frame.render_widget(
-            Paragraph::new(vec![Line::from(""), Line::from("↶ 10s    10s ↷    [P]")])
+            Paragraph::new(format!(
+                "{} / {}",
+                format_time(self.playback.position),
+                format_time(self.playback.duration)
+            ))
+            .alignment(Alignment::Right)
+            .style(strip_style.fg(Color::LightCyan)),
+            timestamp_area,
+        );
+        let actions_row = Rect::new(
+            actions_area.x,
+            actions_area.y + actions_area.height / 2,
+            actions_area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new("[ -10s  +10s ]   P")
                 .alignment(Alignment::Center)
                 .style(strip_style),
-            actions_area,
+            actions_row,
         );
     }
 
@@ -379,6 +402,8 @@ impl App {
                         video_id: video_id.clone(),
                         title: item.title.clone(),
                         artist: item.detail.clone(),
+                        views: None,
+                        likes: None,
                     })
                 })
                 .collect(),
@@ -404,7 +429,7 @@ impl App {
             .constraints([Constraint::Length(3), Constraint::Min(1)])
             .areas(area);
         let query = if self.search_query.is_empty() && !self.search_editing {
-            "Search YouTube Music...".to_owned()
+            "What do you want to listen to?".to_owned()
         } else if self.search_editing {
             format!("{}|", self.search_query)
         } else {
@@ -637,6 +662,27 @@ fn format_time(seconds: f64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
+fn format_count(count: Option<u64>) -> String {
+    let Some(count) = count else {
+        return "—".to_owned();
+    };
+    let (divisor, suffix) = if count >= 1_000_000_000 {
+        (1_000_000_000.0, "b")
+    } else if count >= 1_000_000 {
+        (1_000_000.0, "m")
+    } else if count >= 1_000 {
+        (1_000.0, "k")
+    } else {
+        return count.to_string();
+    };
+    let scaled = count as f64 / divisor;
+    if scaled >= 100.0 || scaled.fract() < 0.05 {
+        format!("{scaled:.0}{suffix}")
+    } else {
+        format!("{scaled:.1}{suffix}")
+    }
+}
+
 fn render_bubble_tabs(frame: &mut Frame, area: Rect, labels: &[&str], selected: usize) {
     if labels.is_empty() || area.width < 4 || area.height < 3 {
         return;
@@ -742,5 +788,13 @@ mod tests {
     #[test]
     fn wraps_notifications_on_word_boundaries() {
         assert_eq!(wrap_text("one two three", 7), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn humanizes_engagement_counts() {
+        assert_eq!(format_count(Some(999)), "999");
+        assert_eq!(format_count(Some(6_900)), "6.9k");
+        assert_eq!(format_count(Some(2_000_000)), "2m");
+        assert_eq!(format_count(None), "—");
     }
 }

@@ -6,7 +6,7 @@ use self::model::{
     Screen, SearchItem, home_shelves, search_items,
 };
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
-use crate::scraper::ytmusic::YTMusic;
+use crate::scraper::ytmusic::{AudioStreamInfo, YTMusic};
 use color_eyre::eyre::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use innertube_rs::{MusicHomeFeed, MusicSearchResults};
@@ -20,7 +20,7 @@ use tokio::runtime::Runtime;
 const NAV_ITEMS: [&str; 2] = ["Home", "Search"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-type PlayRequestResult = innertube_rs::error::Result<(QueueSource, usize, String)>;
+type PlayRequestResult = innertube_rs::error::Result<(QueueSource, usize, AudioStreamInfo)>;
 type SearchRequestResult = innertube_rs::error::Result<MusicSearchResults>;
 
 pub fn run() -> Result<()> {
@@ -325,11 +325,15 @@ impl App {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok((source, index, url))) => {
+            Ok(Ok((source, index, stream))) => {
                 self.play_receiver = None;
                 self.player = None;
-                self.playback.stream_url = Some(url.clone());
-                match MpvPlayer::start(&url) {
+                self.playback.stream_url = Some(stream.url.clone());
+                if let Some(track) = &mut self.playback.track {
+                    track.views = stream.views;
+                    track.likes = stream.likes;
+                }
+                match MpvPlayer::start(&stream.url) {
                     Ok(player) => {
                         self.player = Some(player);
                         self.playback.source = Some(source);
@@ -505,9 +509,9 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         self.runtime.spawn(async move {
             let result = ytmusic
-                .get_audio_url(&video_id)
+                .get_audio_stream(&video_id)
                 .await
-                .map(|url| (source, index, url));
+                .map(|stream| (source, index, stream));
             let _ = sender.send(result);
         });
         self.play_receiver = Some(receiver);
@@ -584,6 +588,8 @@ impl App {
                     video_id: video_id.clone(),
                     title: item.title.clone(),
                     artist: item.detail.clone(),
+                    views: None,
+                    likes: None,
                 })
             }),
         }

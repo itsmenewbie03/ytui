@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::{env, fs, io::Write, path::PathBuf};
+use std::{
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -70,6 +75,13 @@ impl Credentials {
         normalize_cookie(cookie).map(|cookie| Self { cookie })
     }
 
+    pub fn from_netscape_file(path: &str) -> Result<Self, String> {
+        let path = expand_home(path)?;
+        let contents = fs::read_to_string(&path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        parse_netscape_cookies(&contents).map(|cookie| Self { cookie })
+    }
+
     pub fn cookie(&self) -> &str {
         &self.cookie
     }
@@ -123,6 +135,81 @@ fn normalize_cookie(input: &str) -> Result<String, String> {
         return Err("cookie is missing SAPISID".to_owned());
     }
     Ok(cookie.to_owned())
+}
+
+fn parse_netscape_cookies(input: &str) -> Result<String, String> {
+    let header = input
+        .lines()
+        .next()
+        .map(|line| line.trim_start_matches('\u{feff}'));
+    if !matches!(
+        header,
+        Some("# HTTP Cookie File" | "# Netscape HTTP Cookie File")
+    ) {
+        return Err("file is not a Netscape cookies.txt export".to_owned());
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_secs();
+    let mut cookies = Vec::new();
+
+    for (index, line) in input.lines().enumerate().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || (line.starts_with('#') && !line.starts_with("#HttpOnly_")) {
+            continue;
+        }
+        let fields = line.splitn(7, '\t').collect::<Vec<_>>();
+        if fields.len() != 7 {
+            return Err(format!(
+                "invalid Netscape cookie record on line {}",
+                index + 1
+            ));
+        }
+
+        let domain = fields[0]
+            .strip_prefix("#HttpOnly_")
+            .unwrap_or(fields[0])
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if domain != "music.youtube.com" && !"music.youtube.com".ends_with(&format!(".{domain}")) {
+            continue;
+        }
+        if fields[2] != "/" && !"/youtubei/v1/browse".starts_with(fields[2]) {
+            continue;
+        }
+        let expires = fields[4]
+            .parse::<u64>()
+            .map_err(|_| format!("invalid cookie expiration on line {}", index + 1))?;
+        if expires != 0 && expires <= now {
+            continue;
+        }
+        if fields[5].is_empty() {
+            return Err(format!("cookie name is empty on line {}", index + 1));
+        }
+        cookies.push(format!("{}={}", fields[5], fields[6]));
+    }
+
+    normalize_cookie(&cookies.join("; "))
+}
+
+fn expand_home(input: &str) -> Result<PathBuf, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("cookie file path cannot be empty".to_owned());
+    }
+    if input == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not available for ~ expansion".to_owned());
+    }
+    if let Some(relative) = input.strip_prefix("~/") {
+        return env::var_os("HOME")
+            .map(|home| Path::new(&home).join(relative))
+            .ok_or_else(|| "HOME is not available for ~ expansion".to_owned());
+    }
+    Ok(PathBuf::from(input))
 }
 
 fn credentials_path() -> Result<PathBuf, String> {
@@ -183,6 +270,43 @@ mod tests {
     fn rejects_cookie_without_sapisid() {
         assert_eq!(
             normalize_cookie("SID=abc").unwrap_err(),
+            "cookie is missing SAPISID"
+        );
+    }
+
+    #[test]
+    fn converts_netscape_youtube_cookies_to_header() {
+        let input = concat!(
+            "# Netscape HTTP Cookie File\n",
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n",
+            "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsecret\n",
+            ".google.com\tTRUE\t/\tTRUE\t0\tNID\tignored\n",
+            "www.youtube.com\tFALSE\t/\tTRUE\t0\tOTHER\tignored\n",
+        );
+
+        let cookie = parse_netscape_cookies(input).expect("valid export should parse");
+
+        assert_eq!(cookie, "SID=abc; SAPISID=secret");
+    }
+
+    #[test]
+    fn rejects_non_netscape_cookie_file() {
+        assert_eq!(
+            parse_netscape_cookies("SAPISID=secret").unwrap_err(),
+            "file is not a Netscape cookies.txt export"
+        );
+    }
+
+    #[test]
+    fn rejects_netscape_export_without_applicable_sapisid() {
+        let input = concat!(
+            "# HTTP Cookie File\n",
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n",
+            "www.youtube.com\tFALSE\t/\tTRUE\t0\tSAPISID\tsecret\n",
+        );
+
+        assert_eq!(
+            parse_netscape_cookies(input).unwrap_err(),
             "cookie is missing SAPISID"
         );
     }

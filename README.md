@@ -73,9 +73,17 @@ Once it opens, choose a home item or press `/`, type a search, and press `Enter`
 
 ## 🔐 Optional Sign-In
 
-Open **Settings**, select **YouTube Music Account**, and press `Enter`. The dialog explains how to copy the `Cookie` request-header value from a signed-in `music.youtube.com` browser session. ytui validates the cookie before saving it to `$XDG_CONFIG_HOME/ytui/credentials` with owner-only permissions on Unix.
+Open **Settings**, select **YouTube Music Account**, and press `Enter` to import a Netscape-format `cookies.txt` file. The recommended export flow follows [yt-dlp's YouTube guidance](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies):
 
-Treat this file like a password: the cookie grants access to your YouTube account. Press `d` on the account setting to remove the local cookie and return to an anonymous session.
+1. Install [`cookies.txt`](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/) for Firefox or [`Get cookies.txt LOCALLY`](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) for Chromium. Allow the extension in private windows.
+2. Open exactly one private window and tab, then sign into YouTube.
+3. In that same tab, visit `https://www.youtube.com/robots.txt`.
+4. Export only `youtube.com` cookies in Netscape format, then immediately close the private window and do not reuse that session.
+5. Enter the exported file path in ytui. Paths beginning with `~/` are supported.
+
+ytui keeps only cookies applicable to `music.youtube.com`, validates the account, and saves the resulting cookie header to `$XDG_CONFIG_HOME/ytui/credentials` with owner-only permissions on Unix. Delete the exported `cookies.txt` afterward. Press `c` on the account setting if you need the previous raw `Cookie` request-header fallback.
+
+Treat both files like passwords: the cookies grant access to your YouTube account. Press `d` on the account setting to remove the local credential and return to an anonymous session. Be careful with similarly named browser extensions: yt-dlp specifically warns against the old **Get cookies.txt** extension, which was reported as malware.
 
 ## ⌨️ Controls
 
@@ -91,7 +99,7 @@ Treat this file like a password: the cookie grants access to your YouTube accoun
 | `P` | Open or close the full player |
 | `q` | Quit |
 
-In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to open it, and `d` to remove a saved account cookie.
+In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to import `cookies.txt`, `c` to paste a raw cookie header, and `d` to remove a saved account cookie.
 
 ### 🎵 Playback
 

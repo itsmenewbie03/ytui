@@ -2,12 +2,12 @@ mod model;
 mod ui;
 
 use self::model::{
-    Focus, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack, QueueSource,
-    Screen, SearchItem, home_shelves, search_items,
+    Focus, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack, Screen,
+    SearchItem, home_shelves, search_items,
 };
 use crate::config::{Config, Credentials};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
-use crate::scraper::ytmusic::{AccountIdentity, AudioStreamInfo, YTMusic};
+use crate::scraper::ytmusic::{AccountIdentity, AudioStreamInfo, UpNextQueue, YTMusic};
 use color_eyre::eyre::{Context, Result};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
@@ -41,7 +41,8 @@ const ACCENT_COLORS: [AccentColor; 14] = [
     AccentColor::new("Blue", 0x89, 0xb4, 0xfa),
     AccentColor::new("Lavender", 0xb4, 0xbe, 0xfe),
 ];
-type PlayRequestResult = innertube_rs::error::Result<(QueueSource, usize, AudioStreamInfo)>;
+type PlayRequestResult = innertube_rs::error::Result<AudioStreamInfo>;
+type UpNextRequestResult = innertube_rs::error::Result<UpNextQueue>;
 type SearchRequestResult = innertube_rs::error::Result<MusicSearchResults>;
 type InitRequestResult = innertube_rs::error::Result<(YTMusic, Option<AccountIdentity>)>;
 type AuthRequestResult = innertube_rs::error::Result<(YTMusic, AccountIdentity, Credentials)>;
@@ -137,6 +138,8 @@ struct App {
     home_state: ListState,
     home_error: Option<String>,
     play_receiver: Option<Receiver<PlayRequestResult>>,
+    up_next_receiver: Option<Receiver<UpNextRequestResult>>,
+    up_next_state: ListState,
     player: Option<MpvPlayer>,
     playback: PlaybackState,
     notification: Option<Notification>,
@@ -192,6 +195,8 @@ impl App {
             home_state: ListState::default(),
             home_error: None,
             play_receiver: None,
+            up_next_receiver: None,
+            up_next_state: ListState::default(),
             player: None,
             playback: PlaybackState::default(),
             notification: config_warning
@@ -216,6 +221,7 @@ impl App {
             self.poll_home();
             self.poll_search();
             self.poll_play_request();
+            self.poll_up_next();
             self.poll_player_events();
             self.expire_notification();
             terminal.draw(|frame| self.render(frame))?;
@@ -270,6 +276,13 @@ impl App {
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
                             self.next_player_tab();
                         }
+                        KeyCode::Up | KeyCode::Char('k') if self.player_tab == 1 => {
+                            self.previous_up_next();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if self.player_tab == 1 => {
+                            self.next_up_next();
+                        }
+                        KeyCode::Enter if self.player_tab == 1 => self.play_selected_up_next(),
                         KeyCode::Char(' ') => self.toggle_pause(),
                         KeyCode::Char('[') => self.seek(-10),
                         KeyCode::Char(']') => self.seek(10),
@@ -518,6 +531,7 @@ impl App {
         self.home_receiver = Some(receiver);
         self.search_receiver = None;
         self.play_receiver = None;
+        self.up_next_receiver = None;
     }
 
     fn start_initialization(&mut self, cookie: Option<String>) {
@@ -535,6 +549,7 @@ impl App {
         self.home_error = None;
         self.search_receiver = None;
         self.play_receiver = None;
+        self.up_next_receiver = None;
     }
 
     fn poll_home(&mut self) {
@@ -574,7 +589,7 @@ impl App {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok((source, index, stream))) => {
+            Ok(Ok(stream)) => {
                 self.play_receiver = None;
                 self.player = None;
                 self.playback.stream_url = Some(stream.url.clone());
@@ -585,8 +600,6 @@ impl App {
                 match MpvPlayer::start(&stream.url) {
                     Ok(player) => {
                         self.player = Some(player);
-                        self.playback.source = Some(source);
-                        self.playback.current_index = Some(index);
                         self.playback.position = 0.0;
                         self.playback.duration = 0.0;
                         self.playback.status = PlaybackStatus::Loading;
@@ -601,6 +614,67 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 self.play_receiver = None;
                 self.playback_error("The playback task stopped unexpectedly.".to_owned());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn poll_up_next(&mut self) {
+        let Some(receiver) = &self.up_next_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(queue)) => {
+                self.up_next_receiver = None;
+                self.playback.queue_loading = false;
+                self.playback.queue_error = None;
+                let current_track = self.playback.track.clone();
+                let mut tracks = queue
+                    .tracks
+                    .into_iter()
+                    .map(|track| PlaybackTrack {
+                        video_id: track.video_id,
+                        title: track.title,
+                        artist: track.artist,
+                        duration: track.duration,
+                        views: None,
+                        likes: None,
+                    })
+                    .collect::<Vec<_>>();
+                let current_index = current_track.as_ref().and_then(|current| {
+                    tracks
+                        .get(queue.current_index)
+                        .filter(|track| track.video_id == current.video_id)
+                        .map(|_| queue.current_index)
+                        .or_else(|| {
+                            tracks
+                                .iter()
+                                .position(|track| track.video_id == current.video_id)
+                        })
+                });
+                let current_index = match (current_index, current_track) {
+                    (Some(index), _) => index,
+                    (None, Some(current)) => {
+                        tracks.insert(0, current);
+                        0
+                    }
+                    (None, None) => queue.current_index.min(tracks.len().saturating_sub(1)),
+                };
+                self.playback.queue = tracks;
+                self.playback.queue_index =
+                    (!self.playback.queue.is_empty()).then_some(current_index);
+                self.up_next_state.select(self.playback.queue_index);
+            }
+            Ok(Err(error)) => {
+                self.up_next_receiver = None;
+                self.playback.queue_loading = false;
+                self.playback.queue_error = Some(format!("Could not load Automix: {error}"));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.up_next_receiver = None;
+                self.playback.queue_loading = false;
+                self.playback.queue_error =
+                    Some("The Automix task stopped unexpectedly.".to_owned());
             }
             Err(TryRecvError::Empty) => {}
         }
@@ -814,8 +888,8 @@ impl App {
             return;
         };
         let entry = &self.home_shelves[self.home_shelf].items[index];
-        if entry.is_playable() {
-            self.request_play(QueueSource::Home(self.home_shelf), index);
+        if let Some(track) = entry.playback_track() {
+            self.request_play(track, true);
         } else {
             self.notification = Some(Notification::info("Browse", entry.browse_message()));
         }
@@ -829,8 +903,16 @@ impl App {
         let Some(index) = self.search_state.selected() else {
             return;
         };
-        if self.search_items[index].video_id.is_some() {
-            self.request_play(QueueSource::Search, index);
+        if let Some(video_id) = &self.search_items[index].video_id {
+            let track = PlaybackTrack {
+                video_id: video_id.clone(),
+                title: self.search_items[index].title.clone(),
+                artist: self.search_items[index].detail.clone(),
+                duration: None,
+                views: None,
+                likes: None,
+            };
+            self.request_play(track, true);
         } else {
             self.notification = Some(Notification::warning(
                 "Not playable",
@@ -839,7 +921,7 @@ impl App {
         }
     }
 
-    fn request_play(&mut self, source: QueueSource, index: usize) {
+    fn request_play(&mut self, track: PlaybackTrack, load_queue: bool) {
         let Some(ytmusic) = self.ytmusic.clone() else {
             self.notification = Some(Notification::warning(
                 "Not ready",
@@ -847,22 +929,30 @@ impl App {
             ));
             return;
         };
-        let Some(track) = self.track(source, index) else {
-            return;
-        };
         let video_id = track.video_id.clone();
         let title = track.title.clone();
         let (sender, receiver) = mpsc::channel();
+        let stream_video_id = video_id.clone();
         self.runtime.spawn(async move {
-            let result = ytmusic
-                .get_audio_stream(&video_id)
-                .await
-                .map(|stream| (source, index, stream));
+            let result = ytmusic.get_audio_stream(&stream_video_id).await;
             let _ = sender.send(result);
         });
+        if load_queue {
+            let Some(queue_client) = self.ytmusic.clone() else {
+                return;
+            };
+            let (sender, receiver) = mpsc::channel();
+            self.runtime.spawn(async move {
+                let _ = sender.send(queue_client.get_up_next(&video_id).await);
+            });
+            self.up_next_receiver = Some(receiver);
+            self.playback.queue = vec![track.clone()];
+            self.playback.queue_index = Some(0);
+            self.playback.queue_loading = true;
+            self.playback.queue_error = None;
+            self.up_next_state.select(Some(0));
+        }
         self.play_receiver = Some(receiver);
-        self.playback.source = Some(source);
-        self.playback.current_index = Some(index);
         self.playback.track = Some(track);
         self.playback.position = 0.0;
         self.playback.duration = 0.0;
@@ -893,15 +983,12 @@ impl App {
     }
 
     fn next_track(&mut self) {
-        let Some(source) = self.playback.source else {
+        let Some(current) = self.playback.queue_index else {
             return;
         };
-        let Some(current) = self.playback.current_index else {
-            return;
-        };
-        if let Some(next) = self.next_playable_index(source, current) {
-            self.select_queue_index(source, next);
-            self.request_play(source, next);
+        let next = current + 1;
+        if next < self.playback.queue.len() {
+            self.play_queue_index(next);
         } else {
             self.playback.status = PlaybackStatus::Stopped;
             self.notification = Some(Notification::info("Queue finished", "No next track."));
@@ -909,68 +996,40 @@ impl App {
     }
 
     fn previous_track(&mut self) {
-        let Some(source) = self.playback.source else {
+        let Some(current) = self.playback.queue_index else {
             return;
         };
-        let Some(current) = self.playback.current_index else {
+        if current > 0 {
+            self.play_queue_index(current - 1);
+        }
+    }
+
+    fn play_queue_index(&mut self, index: usize) {
+        let Some(track) = self.playback.queue.get(index).cloned() else {
             return;
         };
-        if let Some(previous) = self.previous_playable_index(source, current) {
-            self.select_queue_index(source, previous);
-            self.request_play(source, previous);
-        }
+        self.playback.queue_index = Some(index);
+        self.up_next_state.select(Some(index));
+        self.request_play(track, false);
     }
 
-    fn track(&self, source: QueueSource, index: usize) -> Option<PlaybackTrack> {
-        match source {
-            QueueSource::Home(shelf) => self
-                .home_shelves
-                .get(shelf)?
-                .items
-                .get(index)?
-                .playback_track(),
-            QueueSource::Search => self.search_items.get(index).and_then(|item| {
-                item.video_id.as_ref().map(|video_id| PlaybackTrack {
-                    video_id: video_id.clone(),
-                    title: item.title.clone(),
-                    artist: item.detail.clone(),
-                    views: None,
-                    likes: None,
-                })
-            }),
-        }
+    fn previous_up_next(&mut self) {
+        let selected = self.up_next_state.selected().unwrap_or_default();
+        self.up_next_state.select(Some(selected.saturating_sub(1)));
     }
 
-    fn next_playable_index(&self, source: QueueSource, current: usize) -> Option<usize> {
-        match source {
-            QueueSource::Home(shelf) => self.home_shelves.get(shelf).and_then(|shelf| {
-                (current + 1..shelf.items.len()).find(|index| shelf.items[*index].is_playable())
-            }),
-            QueueSource::Search => (current + 1..self.search_items.len())
-                .find(|index| self.search_items[*index].video_id.is_some()),
+    fn next_up_next(&mut self) {
+        if self.playback.queue.is_empty() {
+            return;
         }
+        let selected = self.up_next_state.selected().unwrap_or_default();
+        self.up_next_state
+            .select(Some((selected + 1).min(self.playback.queue.len() - 1)));
     }
 
-    fn previous_playable_index(&self, source: QueueSource, current: usize) -> Option<usize> {
-        match source {
-            QueueSource::Home(shelf) => self.home_shelves.get(shelf).and_then(|shelf| {
-                (0..current)
-                    .rev()
-                    .find(|index| shelf.items[*index].is_playable())
-            }),
-            QueueSource::Search => (0..current)
-                .rev()
-                .find(|index| self.search_items[*index].video_id.is_some()),
-        }
-    }
-
-    fn select_queue_index(&mut self, source: QueueSource, index: usize) {
-        match source {
-            QueueSource::Home(shelf) => {
-                self.home_shelf = shelf;
-                self.home_state.select(Some(index));
-            }
-            QueueSource::Search => self.search_state.select(Some(index)),
+    fn play_selected_up_next(&mut self) {
+        if let Some(index) = self.up_next_state.selected() {
+            self.play_queue_index(index);
         }
     }
 

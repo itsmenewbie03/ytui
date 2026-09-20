@@ -12,6 +12,7 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 - Browse YouTube Music home shelves
 - Sign in with a browser cookie for personalized account data
 - Search for songs, videos, albums, artists, and playlists
+- Build interactive Up Next queues from YouTube Music Automix
 - Play the highest-quality available audio stream through `mpv`
 - Pause, seek, and move through the current queue
 - See playback progress, duration, views, and likes at a glance

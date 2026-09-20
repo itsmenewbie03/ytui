@@ -56,10 +56,6 @@ impl HomeEntry {
         }
     }
 
-    pub(super) fn is_playable(&self) -> bool {
-        matches!(self, Self::Track { .. })
-    }
-
     pub(super) fn playback_track(&self) -> Option<PlaybackTrack> {
         let Self::Track {
             video_id,
@@ -73,6 +69,7 @@ impl HomeEntry {
             video_id: video_id.clone(),
             title: title.clone(),
             artist: artist.clone(),
+            duration: None,
             views: None,
             likes: None,
         })
@@ -103,24 +100,22 @@ pub(super) struct SearchItem {
     pub(super) video_id: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum QueueSource {
-    Home(usize),
-    Search,
-}
-
+#[derive(Clone)]
 pub(super) struct PlaybackTrack {
     pub(super) video_id: String,
     pub(super) title: String,
     pub(super) artist: String,
+    pub(super) duration: Option<String>,
     pub(super) views: Option<u64>,
     pub(super) likes: Option<u64>,
 }
 
 #[derive(Default)]
 pub(super) struct PlaybackState {
-    pub(super) source: Option<QueueSource>,
-    pub(super) current_index: Option<usize>,
+    pub(super) queue: Vec<PlaybackTrack>,
+    pub(super) queue_index: Option<usize>,
+    pub(super) queue_loading: bool,
+    pub(super) queue_error: Option<String>,
     pub(super) track: Option<PlaybackTrack>,
     pub(super) status: PlaybackStatus,
     pub(super) position: f64,

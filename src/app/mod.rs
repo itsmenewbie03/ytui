@@ -5,23 +5,64 @@ use self::model::{
     Focus, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack, QueueSource,
     Screen, SearchItem, home_shelves, search_items,
 };
+use crate::config::Config;
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
 use crate::scraper::ytmusic::{AudioStreamInfo, YTMusic};
 use color_eyre::eyre::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use innertube_rs::{MusicHomeFeed, MusicSearchResults};
-use ratatui::{DefaultTerminal, widgets::ListState};
+use ratatui::{DefaultTerminal, style::Color, widgets::ListState};
 use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 use tokio::runtime::Runtime;
 
-const NAV_ITEMS: [&str; 2] = ["Home", "Search"];
+const NAV_ITEMS: [&str; 3] = ["Home", "Search", "Settings"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const DEFAULT_ACCENT: usize = 10;
+const ACCENT_COLORS: [AccentColor; 14] = [
+    AccentColor::new("Rosewater", 0xf5, 0xe0, 0xdc),
+    AccentColor::new("Flamingo", 0xf2, 0xcd, 0xcd),
+    AccentColor::new("Pink", 0xf5, 0xc2, 0xe7),
+    AccentColor::new("Mauve", 0xcb, 0xa6, 0xf7),
+    AccentColor::new("Red", 0xf3, 0x8b, 0xa8),
+    AccentColor::new("Maroon", 0xeb, 0xa0, 0xac),
+    AccentColor::new("Peach", 0xfa, 0xb3, 0x87),
+    AccentColor::new("Yellow", 0xf9, 0xe2, 0xaf),
+    AccentColor::new("Green", 0xa6, 0xe3, 0xa1),
+    AccentColor::new("Teal", 0x94, 0xe2, 0xd5),
+    AccentColor::new("Sky", 0x89, 0xdc, 0xeb),
+    AccentColor::new("Sapphire", 0x74, 0xc7, 0xec),
+    AccentColor::new("Blue", 0x89, 0xb4, 0xfa),
+    AccentColor::new("Lavender", 0xb4, 0xbe, 0xfe),
+];
 type PlayRequestResult = innertube_rs::error::Result<(QueueSource, usize, AudioStreamInfo)>;
 type SearchRequestResult = innertube_rs::error::Result<MusicSearchResults>;
+
+#[derive(Clone, Copy)]
+struct AccentColor {
+    name: &'static str,
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl AccentColor {
+    const fn new(name: &'static str, red: u8, green: u8, blue: u8) -> Self {
+        Self {
+            name,
+            red,
+            green,
+            blue,
+        }
+    }
+
+    const fn color(self) -> Color {
+        Color::Rgb(self.red, self.green, self.blue)
+    }
+}
 
 pub fn run() -> Result<()> {
     let runtime = Runtime::new().wrap_err("failed to create async runtime")?;
@@ -59,6 +100,7 @@ struct App {
     search_complete: bool,
     search_error: Option<String>,
     search_receiver: Option<Receiver<SearchRequestResult>>,
+    settings_state: ListState,
     animation_started: Instant,
 }
 
@@ -69,6 +111,18 @@ impl App {
     ) -> Self {
         let mut nav = ListState::default();
         nav.select(Some(0));
+        let (configured_accent, mut config_warning) = match Config::load() {
+            Ok(config) => (config.accent, None),
+            Err(error) => (ACCENT_COLORS[DEFAULT_ACCENT].name.to_owned(), Some(error)),
+        };
+        let accent_index = ACCENT_COLORS
+            .iter()
+            .position(|accent| accent.name.eq_ignore_ascii_case(&configured_accent));
+        if accent_index.is_none() && config_warning.is_none() {
+            config_warning = Some(format!("unknown accent color: {configured_accent}"));
+        }
+        let mut settings_state = ListState::default();
+        settings_state.select(Some(accent_index.unwrap_or(DEFAULT_ACCENT)));
 
         Self {
             nav,
@@ -86,7 +140,8 @@ impl App {
             play_receiver: None,
             player: None,
             playback: PlaybackState::default(),
-            notification: None,
+            notification: config_warning
+                .map(|error| Notification::warning("Config not loaded", error)),
             search_query: String::new(),
             search_editing: false,
             search_items: Vec::new(),
@@ -94,6 +149,7 @@ impl App {
             search_complete: false,
             search_error: None,
             search_receiver: None,
+            settings_state,
             animation_started: Instant::now(),
         }
     }
@@ -164,6 +220,12 @@ impl App {
                         }
                         KeyCode::Right | KeyCode::Char('l') if self.is_home_list() => {
                             self.next_home_shelf();
+                        }
+                        KeyCode::Left | KeyCode::Char('h') if self.is_settings() => {
+                            self.previous_accent();
+                        }
+                        KeyCode::Right | KeyCode::Char('l') if self.is_settings() => {
+                            self.next_accent();
                         }
                         KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Nav,
                         KeyCode::Up | KeyCode::Char('k') if self.is_home_list() => {
@@ -408,6 +470,35 @@ impl App {
     }
     fn is_home_list(&self) -> bool {
         self.nav.selected() == Some(0)
+    }
+
+    fn is_settings(&self) -> bool {
+        self.nav.selected() == Some(2)
+    }
+
+    fn accent_color(&self) -> Color {
+        ACCENT_COLORS[self.settings_state.selected().unwrap_or(DEFAULT_ACCENT)].color()
+    }
+
+    fn previous_accent(&mut self) {
+        let selected = self.settings_state.selected().unwrap_or(DEFAULT_ACCENT);
+        self.select_accent(selected.saturating_sub(1));
+    }
+
+    fn next_accent(&mut self) {
+        let selected = self.settings_state.selected().unwrap_or(DEFAULT_ACCENT);
+        self.select_accent((selected + 1).min(ACCENT_COLORS.len() - 1));
+    }
+
+    fn select_accent(&mut self, index: usize) {
+        self.settings_state.select(Some(index));
+        if let Err(error) = (Config {
+            accent: ACCENT_COLORS[index].name.to_owned(),
+        })
+        .save()
+        {
+            self.notification = Some(Notification::warning("Config not saved", error));
+        }
     }
 
     fn previous_home(&mut self) {

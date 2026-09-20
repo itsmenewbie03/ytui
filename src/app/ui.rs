@@ -1,4 +1,4 @@
-use super::{App, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES};
+use super::{ACCENT_COLORS, App, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES};
 use crate::app::model::{
     Focus, HomeEntry, NotificationMode, PlaybackStatus, PlaybackTrack, QueueSource, Screen,
 };
@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph,
         Wrap,
@@ -23,6 +23,7 @@ impl App {
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
+        let accent = self.accent_color();
         let mini_height = u16::from(self.playback.track.is_some()) * 5;
         let [body, mini_player, help] = Layout::default()
             .direction(Direction::Vertical)
@@ -44,16 +45,14 @@ impl App {
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(if self.focus == Focus::Nav {
-                        Color::Cyan
+                        accent
                     } else {
                         Color::DarkGray
                     })),
             )
             .highlight_symbol(" ")
             .highlight_style(if self.focus == Focus::Nav {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             });
@@ -71,6 +70,8 @@ impl App {
             " h/l: shelf  j/k: select  Enter: play  Esc: navigation  P: player "
         } else if self.is_search_list() {
             " j/k: select  Enter: play  /: search  Space: pause  P: player  Esc: navigation "
+        } else if self.is_settings() {
+            " h/l: preview accent  Esc: navigation  q: quit "
         } else {
             " Space: pause  [/] seek  n/p: track  P: player  Esc: navigation "
         };
@@ -81,14 +82,16 @@ impl App {
     }
 
     fn render_main_content(&mut self, frame: &mut Frame, area: Rect) {
-        if NAV_ITEMS[self.nav.selected().unwrap_or_default()] == "Search" {
-            self.render_search(frame, area);
-        } else {
-            self.render_home(frame, area);
+        match self.nav.selected().unwrap_or_default() {
+            0 => self.render_home(frame, area),
+            1 => self.render_search(frame, area),
+            2 => self.render_settings(frame, area),
+            _ => unreachable!(),
         }
     }
 
     fn render_home(&mut self, frame: &mut Frame, area: Rect) {
+        let accent = self.accent_color();
         if self.home_shelves.is_empty() {
             let (message, loading) = if let Some(error) = &self.home_error {
                 (error.clone(), false)
@@ -111,11 +114,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(message)
                     .alignment(Alignment::Center)
-                    .style(Style::default().fg(if loading {
-                        Color::LightCyan
-                    } else {
-                        Color::DarkGray
-                    })),
+                    .style(Style::default().fg(if loading { accent } else { Color::DarkGray })),
                 message_area,
             );
             return;
@@ -131,15 +130,18 @@ impl App {
             .map(|s| s.title.as_str())
             .collect::<Vec<_>>();
         let is_focused = self.focus == Focus::Content;
-        render_bubble_tabs(frame, shelf_tabs, &labels, self.home_shelf, is_focused);
+        render_bubble_tabs(
+            frame,
+            shelf_tabs,
+            &labels,
+            self.home_shelf,
+            is_focused,
+            accent,
+        );
         let shelf_window = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if is_focused {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            }));
+            .border_style(Style::default().fg(if is_focused { accent } else { Color::DarkGray }));
         let shelf_content = shelf_window.inner(list_area);
         frame.render_widget(shelf_window, list_area);
         let shelf = &self.home_shelves[self.home_shelf];
@@ -155,9 +157,7 @@ impl App {
         let items = shelf.items.iter().enumerate().map(|(index, item)| {
             let is_selected = selected == Some(index);
             let title_style = if is_selected && is_focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
             } else if is_selected {
                 Style::default()
                     .fg(Color::Gray)
@@ -166,7 +166,7 @@ impl App {
                 Style::default().add_modifier(Modifier::BOLD)
             };
             let detail_style = if is_selected && is_focused {
-                Style::default().fg(Color::LightCyan)
+                Style::default().fg(accent)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -177,24 +177,105 @@ impl App {
         });
         let list = List::new(items)
             .highlight_symbol("│ ")
-            .highlight_style(Style::default().fg(if is_focused {
-                Color::Cyan
-            } else {
-                Color::Gray
-            }))
+            .highlight_style(Style::default().fg(if is_focused { accent } else { Color::Gray }))
             .repeat_highlight_symbol(true);
         frame.render_stateful_widget(list, shelf_content, &mut self.home_state);
+    }
+
+    fn render_settings(&mut self, frame: &mut Frame, area: Rect) {
+        let accent = self.accent_color();
+        let is_focused = self.focus == Focus::Content;
+        let container = Block::default()
+            .title(" Settings ")
+            .title_style(Style::default().add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(if is_focused { accent } else { Color::DarkGray }))
+            .padding(Padding::horizontal(1));
+        let container_inner = container.inner(area);
+        frame.render_widget(container, area);
+        let margin = 1.min(container_inner.width / 2);
+        let inner = Rect::new(
+            container_inner.x + margin,
+            container_inner.y,
+            container_inner.width.saturating_sub(margin * 2),
+            container_inner.height,
+        );
+        let header = "APPEARANCE ";
+        let rule = "─".repeat(usize::from(inner.width).saturating_sub(header.chars().count()));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    header,
+                    Style::default()
+                        .fg(if is_focused { accent } else { Color::DarkGray })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rule, Style::default().fg(Color::DarkGray)),
+            ])),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        let selected = self.settings_state.selected().unwrap_or_default();
+        let setting_width = inner.width.saturating_sub(1);
+        let option_lines = accent_option_lines(
+            setting_width.saturating_sub(5),
+            selected,
+            is_focused,
+            accent,
+        );
+        let setting_height = u16::try_from(option_lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(3)
+            .min(inner.height.saturating_sub(2));
+        let setting_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(2),
+            setting_width,
+            setting_height,
+        );
+        let setting_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(if is_focused { accent } else { Color::DarkGray }))
+            .padding(Padding::horizontal(2));
+        let setting_inner = setting_block.inner(setting_area);
+        frame.render_widget(setting_block, setting_area);
+
+        let mut lines = vec![Line::styled(
+            "Accent Color",
+            Style::default()
+                .fg(if is_focused {
+                    Color::White
+                } else {
+                    Color::Gray
+                })
+                .add_modifier(Modifier::BOLD),
+        )];
+        lines.extend(option_lines);
+        lines.push(Line::styled(
+            "[←] [→] cycle accent color",
+            Style::default().fg(Color::DarkGray),
+        ));
+        lines.push(Line::styled(
+            "Applied across the interface and saved in your XDG config directory",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: true }),
+            setting_inner,
+        );
     }
 
     fn render_mini_player(&self, frame: &mut Frame, area: Rect) {
         let Some(track) = &self.playback.track else {
             return;
         };
+        let accent = self.accent_color();
         let block = Block::default()
             .title(" Now playing ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(accent));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let strip_style = Style::default().fg(Color::Gray);
@@ -212,9 +293,7 @@ impl App {
         } else {
             ""
         };
-        let control_style = strip_style
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD);
+        let control_style = strip_style.fg(accent).add_modifier(Modifier::BOLD);
         let transport_row = Rect::new(
             transport_area.x,
             transport_area.y + transport_area.height / 2,
@@ -259,7 +338,7 @@ impl App {
         frame.render_widget(
             LineGauge::default()
                 .ratio(self.playback_ratio())
-                .filled_style(Style::default().fg(Color::Cyan))
+                .filled_style(Style::default().fg(accent))
                 .unfilled_style(Style::default().fg(Color::DarkGray))
                 .label(""),
             gauge_area,
@@ -271,7 +350,7 @@ impl App {
                 format_time(self.playback.duration)
             ))
             .alignment(Alignment::Right)
-            .style(strip_style.fg(Color::LightCyan)),
+            .style(strip_style.fg(accent)),
             timestamp_area,
         );
         let actions_row = Rect::new(
@@ -289,6 +368,7 @@ impl App {
     }
 
     fn render_player_screen(&self, frame: &mut Frame) {
+        let accent = self.accent_color();
         let [summary, tabs, content, help] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -299,11 +379,11 @@ impl App {
             ])
             .areas(frame.area());
         self.render_player_summary(frame, summary);
-        render_bubble_tabs(frame, tabs, &PLAYER_TABS, self.player_tab, true);
+        render_bubble_tabs(frame, tabs, &PLAYER_TABS, self.player_tab, true, accent);
         let block = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(accent))
             .padding(Padding::proportional(1));
         let inner = block.inner(content);
         frame.render_widget(block, content);
@@ -377,7 +457,7 @@ impl App {
     fn progress_gauge(&self) -> Gauge<'static> {
         Gauge::default()
             .ratio(self.playback_ratio())
-            .gauge_style(Style::default().fg(Color::Cyan))
+            .gauge_style(Style::default().fg(self.accent_color()))
             .label(format!(
                 "{} / {}",
                 format_time(self.playback.position),
@@ -443,6 +523,7 @@ impl App {
     }
 
     fn render_search(&mut self, frame: &mut Frame, area: Rect) {
+        let accent = self.accent_color();
         let [query_area, results_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(1)])
@@ -455,7 +536,7 @@ impl App {
             self.search_query.clone()
         };
         let query_style = if self.search_editing {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(accent)
         } else {
             Style::default()
         };
@@ -466,7 +547,7 @@ impl App {
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(if self.search_editing {
-                        Color::Cyan
+                        accent
                     } else {
                         Color::DarkGray
                     }))
@@ -480,7 +561,7 @@ impl App {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(if results_focused {
-                Color::Cyan
+                accent
             } else {
                 Color::DarkGray
             }));
@@ -499,7 +580,7 @@ impl App {
                     self.spinner_frame()
                 ))
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::LightCyan)),
+                .style(Style::default().fg(accent)),
                 loading_area,
             );
         } else if let Some(error) = &self.search_error {
@@ -530,9 +611,7 @@ impl App {
             let items = self.search_items.iter().enumerate().map(|(index, item)| {
                 let is_selected = selected == Some(index);
                 let title_style = if is_selected && results_focused {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD)
                 } else if is_selected {
                     Style::default()
                         .fg(Color::Gray)
@@ -541,7 +620,7 @@ impl App {
                     Style::default().add_modifier(Modifier::BOLD)
                 };
                 let detail_style = if is_selected && results_focused {
-                    Style::default().fg(Color::LightCyan)
+                    Style::default().fg(accent)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
@@ -554,7 +633,7 @@ impl App {
                 List::new(items)
                     .highlight_symbol("│ ")
                     .highlight_style(Style::default().fg(if results_focused {
-                        Color::Cyan
+                        accent
                     } else {
                         Color::Gray
                     }))
@@ -649,7 +728,9 @@ impl App {
                     .title(format!(" {} ", notification.title))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(notification.color))
+                    .border_style(
+                        Style::default().fg(notification.color.unwrap_or(self.accent_color())),
+                    )
                     .padding(Padding::horizontal(1)),
             ),
             popup,
@@ -727,12 +808,59 @@ fn format_count(count: Option<u64>) -> String {
     }
 }
 
+fn accent_option_lines(
+    width: u16,
+    selected: usize,
+    is_focused: bool,
+    accent: Color,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut used: u16 = 0;
+    for (index, option) in ACCENT_COLORS.iter().enumerate() {
+        let option_width = option.name.chars().count() as u16 + 4;
+        if used > 0 && used.saturating_add(option_width) > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        let (bullet_style, name_style) = if is_focused {
+            (
+                Style::default().fg(option.color()),
+                Style::default().fg(Color::Gray),
+            )
+        } else {
+            (
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+        if index == selected {
+            let selected_style = Style::default()
+                .fg(if is_focused { accent } else { Color::Gray })
+                .add_modifier(Modifier::BOLD);
+            spans.push(Span::styled("● ", selected_style));
+            spans.push(Span::styled(option.name, selected_style));
+        } else {
+            spans.push(Span::styled("○ ", bullet_style));
+            spans.push(Span::styled(option.name, name_style));
+        }
+        spans.push(Span::raw("  "));
+        used = used.saturating_add(option_width);
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
 fn render_bubble_tabs(
     frame: &mut Frame,
     area: Rect,
     labels: &[&str],
     selected: usize,
     is_focused: bool,
+    accent: Color,
 ) {
     if labels.is_empty() || area.width < 4 || area.height < 3 {
         return;
@@ -764,19 +892,13 @@ fn render_bubble_tabs(
         }
         let width = widths[index].min(area.right().saturating_sub(x));
         let tab_area = Rect::new(x, area.y, width, 3);
-        let border_color = if is_focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
+        let border_color = if is_focused { accent } else { Color::DarkGray };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
         let style = if is_selected && is_focused {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
         } else if is_selected {
             Style::default()
                 .fg(Color::Gray)
@@ -821,11 +943,7 @@ fn render_bubble_tabs(
         x += width;
     }
     if x < area.right() {
-        let border_style = Style::default().fg(if is_focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        });
+        let border_style = Style::default().fg(if is_focused { accent } else { Color::DarkGray });
         let buffer = frame.buffer_mut();
         for column in x..area.right() - 1 {
             buffer[(column, bottom)]

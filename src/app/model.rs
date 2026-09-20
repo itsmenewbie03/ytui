@@ -160,7 +160,7 @@ impl PlaybackStatus {
 pub(super) struct Notification {
     pub(super) title: &'static str,
     pub(super) message: String,
-    pub(super) color: Color,
+    pub(super) color: Option<Color>,
     pub(super) mode: NotificationMode,
     pub(super) expires_at: Instant,
 }
@@ -172,25 +172,25 @@ pub(super) enum NotificationMode {
 
 impl Notification {
     pub(super) fn info(title: &'static str, message: impl Into<String>) -> Self {
-        Self::new(title, message, Color::Cyan, NotificationMode::Trim)
+        Self::new(title, message, None, NotificationMode::Trim)
     }
 
     pub(super) fn success(title: &'static str, message: impl Into<String>) -> Self {
-        Self::new(title, message, Color::Green, NotificationMode::Trim)
+        Self::new(title, message, Some(Color::Green), NotificationMode::Trim)
     }
 
     pub(super) fn warning(title: &'static str, message: impl Into<String>) -> Self {
-        Self::new(title, message, Color::Yellow, NotificationMode::Trim)
+        Self::new(title, message, Some(Color::Yellow), NotificationMode::Trim)
     }
 
     pub(super) fn error(title: &'static str, message: impl Into<String>) -> Self {
-        Self::new(title, message, Color::Red, NotificationMode::Wrap)
+        Self::new(title, message, Some(Color::Red), NotificationMode::Wrap)
     }
 
     fn new(
         title: &'static str,
         message: impl Into<String>,
-        color: Color,
+        color: Option<Color>,
         mode: NotificationMode,
     ) -> Self {
         Self {

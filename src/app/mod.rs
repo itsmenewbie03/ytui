@@ -5,34 +5,116 @@ use self::model::{
     Focus, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack, QueueSource,
     Screen, SearchItem, home_shelves, search_items,
 };
+use crate::config::{Config, Credentials};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
-use crate::scraper::ytmusic::{AudioStreamInfo, YTMusic};
+use crate::scraper::ytmusic::{AccountIdentity, AudioStreamInfo, YTMusic};
 use color_eyre::eyre::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::{
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
+    execute,
+};
 use innertube_rs::{MusicHomeFeed, MusicSearchResults};
-use ratatui::{DefaultTerminal, widgets::ListState};
+use ratatui::{DefaultTerminal, style::Color, widgets::ListState};
 use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 use tokio::runtime::Runtime;
 
-const NAV_ITEMS: [&str; 2] = ["Home", "Search"];
+const NAV_ITEMS: [&str; 3] = ["Home", "Search", "Settings"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const DEFAULT_ACCENT: usize = 10;
+const ACCENT_COLORS: [AccentColor; 14] = [
+    AccentColor::new("Rosewater", 0xf5, 0xe0, 0xdc),
+    AccentColor::new("Flamingo", 0xf2, 0xcd, 0xcd),
+    AccentColor::new("Pink", 0xf5, 0xc2, 0xe7),
+    AccentColor::new("Mauve", 0xcb, 0xa6, 0xf7),
+    AccentColor::new("Red", 0xf3, 0x8b, 0xa8),
+    AccentColor::new("Maroon", 0xeb, 0xa0, 0xac),
+    AccentColor::new("Peach", 0xfa, 0xb3, 0x87),
+    AccentColor::new("Yellow", 0xf9, 0xe2, 0xaf),
+    AccentColor::new("Green", 0xa6, 0xe3, 0xa1),
+    AccentColor::new("Teal", 0x94, 0xe2, 0xd5),
+    AccentColor::new("Sky", 0x89, 0xdc, 0xeb),
+    AccentColor::new("Sapphire", 0x74, 0xc7, 0xec),
+    AccentColor::new("Blue", 0x89, 0xb4, 0xfa),
+    AccentColor::new("Lavender", 0xb4, 0xbe, 0xfe),
+];
 type PlayRequestResult = innertube_rs::error::Result<(QueueSource, usize, AudioStreamInfo)>;
 type SearchRequestResult = innertube_rs::error::Result<MusicSearchResults>;
+type InitRequestResult = innertube_rs::error::Result<(YTMusic, Option<AccountIdentity>)>;
+type AuthRequestResult = innertube_rs::error::Result<(YTMusic, AccountIdentity, Credentials)>;
+
+#[derive(Clone, Copy)]
+struct AccentColor {
+    name: &'static str,
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl AccentColor {
+    const fn new(name: &'static str, red: u8, green: u8, blue: u8) -> Self {
+        Self {
+            name,
+            red,
+            green,
+            blue,
+        }
+    }
+
+    const fn color(self) -> Color {
+        Color::Rgb(self.red, self.green, self.blue)
+    }
+}
 
 pub fn run() -> Result<()> {
     let runtime = Runtime::new().wrap_err("failed to create async runtime")?;
+    let (config, config_warning) = match Config::load() {
+        Ok(config) => (config, None),
+        Err(error) => (Config::default(), Some(error)),
+    };
+    let (credentials, credentials_warning) = match Credentials::load() {
+        Ok(credentials) => (credentials, None),
+        Err(error) => (None, Some(error)),
+    };
+    let has_credentials = credentials.is_some();
+    let cookie = credentials.map(|credentials| credentials.cookie().to_owned());
     let (init_sender, init_receiver) = mpsc::channel();
     runtime.spawn(async move {
-        let _ = init_sender.send(YTMusic::new().await);
+        let _ = init_sender.send(initialize_client(cookie).await);
     });
 
-    let mut app = App::new(runtime, init_receiver);
-    ratatui::run(|terminal| app.run(terminal))?;
+    let warning = [config_warning, credentials_warning]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut app = App::new(
+        runtime,
+        init_receiver,
+        config,
+        has_credentials,
+        (!warning.is_empty()).then_some(warning),
+    );
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
+    let run_result = ratatui::run(|terminal| app.run(terminal));
+    let paste_result = execute!(std::io::stdout(), DisableBracketedPaste);
+    run_result?;
+    paste_result?;
     Ok(())
+}
+
+async fn initialize_client(cookie: Option<String>) -> InitRequestResult {
+    let authenticated = cookie.is_some();
+    let ytmusic = YTMusic::new(cookie).await?;
+    let identity = if authenticated {
+        Some(ytmusic.account_identity().await?)
+    } else {
+        None
+    };
+    Ok((ytmusic, identity))
 }
 
 struct App {
@@ -41,8 +123,14 @@ struct App {
     screen: Screen,
     player_tab: usize,
     runtime: Runtime,
+    config: Config,
     ytmusic: Option<YTMusic>,
-    init_receiver: Option<Receiver<innertube_rs::error::Result<YTMusic>>>,
+    init_receiver: Option<Receiver<InitRequestResult>>,
+    init_with_cookie: bool,
+    auth_receiver: Option<Receiver<AuthRequestResult>>,
+    cookie_input: Option<String>,
+    has_credentials: bool,
+    account_identity: Option<AccountIdentity>,
     home_receiver: Option<Receiver<innertube_rs::error::Result<MusicHomeFeed>>>,
     home_shelves: Vec<HomeShelf>,
     home_shelf: usize,
@@ -59,16 +147,30 @@ struct App {
     search_complete: bool,
     search_error: Option<String>,
     search_receiver: Option<Receiver<SearchRequestResult>>,
+    settings_state: ListState,
+    settings_row: usize,
     animation_started: Instant,
 }
 
 impl App {
     fn new(
         runtime: Runtime,
-        init_receiver: Receiver<innertube_rs::error::Result<YTMusic>>,
+        init_receiver: Receiver<InitRequestResult>,
+        config: Config,
+        has_credentials: bool,
+        config_warning: Option<String>,
     ) -> Self {
         let mut nav = ListState::default();
         nav.select(Some(0));
+        let accent_index = ACCENT_COLORS
+            .iter()
+            .position(|accent| accent.name.eq_ignore_ascii_case(&config.accent));
+        let mut config_warning = config_warning;
+        if accent_index.is_none() && config_warning.is_none() {
+            config_warning = Some(format!("unknown accent color: {}", config.accent));
+        }
+        let mut settings_state = ListState::default();
+        settings_state.select(Some(accent_index.unwrap_or(DEFAULT_ACCENT)));
 
         Self {
             nav,
@@ -76,8 +178,14 @@ impl App {
             screen: Screen::Main,
             player_tab: 0,
             runtime,
+            config,
             ytmusic: None,
             init_receiver: Some(init_receiver),
+            init_with_cookie: has_credentials,
+            auth_receiver: None,
+            cookie_input: None,
+            has_credentials,
+            account_identity: None,
             home_receiver: None,
             home_shelves: Vec::new(),
             home_shelf: 0,
@@ -86,7 +194,8 @@ impl App {
             play_receiver: None,
             player: None,
             playback: PlaybackState::default(),
-            notification: None,
+            notification: config_warning
+                .map(|error| Notification::warning("Config not loaded", error)),
             search_query: String::new(),
             search_editing: false,
             search_items: Vec::new(),
@@ -94,6 +203,8 @@ impl App {
             search_complete: false,
             search_error: None,
             search_receiver: None,
+            settings_state,
+            settings_row: 0,
             animation_started: Instant::now(),
         }
     }
@@ -101,6 +212,7 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         loop {
             self.poll_initialization();
+            self.poll_authentication();
             self.poll_home();
             self.poll_search();
             self.poll_play_request();
@@ -108,11 +220,37 @@ impl App {
             self.expire_notification();
             terminal.draw(|frame| self.render(frame))?;
 
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                if self.search_editing {
+            if event::poll(Duration::from_millis(100))? {
+                let event = event::read()?;
+                if let Event::Paste(text) = &event
+                    && self.cookie_input.is_some()
+                {
+                    self.append_cookie_input(text);
+                    continue;
+                }
+                let Event::Key(key) = event else { continue };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if self.cookie_input.is_some() {
+                    match key.code {
+                        KeyCode::Enter => self.submit_cookie(),
+                        KeyCode::Esc => self.cookie_input = None,
+                        KeyCode::Backspace => {
+                            if let Some(input) = &mut self.cookie_input {
+                                input.pop();
+                            }
+                        }
+                        KeyCode::Char(character) => {
+                            if let Some(input) = &mut self.cookie_input
+                                && input.len() + character.len_utf8() <= 16 * 1024
+                            {
+                                input.push(character);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if self.search_editing {
                     match key.code {
                         KeyCode::Enter => self.submit_search(),
                         KeyCode::Esc => self.search_editing = false,
@@ -165,6 +303,18 @@ impl App {
                         KeyCode::Right | KeyCode::Char('l') if self.is_home_list() => {
                             self.next_home_shelf();
                         }
+                        KeyCode::Left | KeyCode::Char('h') if self.is_settings() => {
+                            if self.settings_row == 0 {
+                                self.previous_accent();
+                            } else {
+                                self.focus = Focus::Nav;
+                            }
+                        }
+                        KeyCode::Right | KeyCode::Char('l')
+                            if self.is_settings() && self.settings_row == 0 =>
+                        {
+                            self.next_accent();
+                        }
                         KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Nav,
                         KeyCode::Up | KeyCode::Char('k') if self.is_home_list() => {
                             self.previous_home();
@@ -175,11 +325,23 @@ impl App {
                         KeyCode::Up | KeyCode::Char('k') if self.is_search_list() => {
                             self.previous_search();
                         }
+                        KeyCode::Up | KeyCode::Char('k') if self.is_settings() => {
+                            self.settings_row = self.settings_row.saturating_sub(1);
+                        }
                         KeyCode::Down | KeyCode::Char('j') if self.is_search_list() => {
                             self.next_search();
                         }
+                        KeyCode::Down | KeyCode::Char('j') if self.is_settings() => {
+                            self.settings_row = (self.settings_row + 1).min(1);
+                        }
                         KeyCode::Enter if self.is_home_list() => self.select_home_item(),
                         KeyCode::Enter if self.is_search_list() => self.select_search_item(),
+                        KeyCode::Enter if self.is_settings() && self.settings_row == 1 => {
+                            self.open_cookie_input();
+                        }
+                        KeyCode::Char('d') if self.is_settings() && self.settings_row == 1 => {
+                            self.remove_cookie();
+                        }
                         _ => {}
                     }
                 } else {
@@ -254,38 +416,125 @@ impl App {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok(ytmusic)) => {
-                let home_client = ytmusic.clone();
-                let (sender, receiver) = mpsc::channel();
-                self.runtime.spawn(async move {
-                    let _ = sender.send(home_client.get_home().await);
-                });
-                self.ytmusic = Some(ytmusic);
+            Ok(Ok((ytmusic, identity))) => {
                 self.init_receiver = None;
-                self.home_receiver = Some(receiver);
+                self.init_with_cookie = false;
+                self.has_credentials = identity.is_some() || self.has_credentials;
+                self.account_identity = identity;
+                self.activate_client(ytmusic);
                 self.notification = Some(Notification::success(
                     "Connected",
-                    "YouTube Music initialized successfully.",
+                    if self.account_identity.is_some() {
+                        "Signed in to YouTube Music."
+                    } else {
+                        "YouTube Music initialized successfully."
+                    },
                 ));
             }
             Ok(Err(error)) => {
                 self.init_receiver = None;
-                self.home_error = Some(format!("Initialization failed: {error}"));
+                if self.init_with_cookie {
+                    self.start_initialization(None);
+                    self.notification = Some(Notification::warning(
+                        "Cookie not accepted",
+                        format!("{error}. Starting an anonymous session."),
+                    ));
+                } else {
+                    self.home_error = Some(format!("Initialization failed: {error}"));
+                    self.notification = Some(Notification::error(
+                        "Initialization failed",
+                        error.to_string(),
+                    ));
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.init_receiver = None;
+                if self.init_with_cookie {
+                    self.start_initialization(None);
+                    self.notification = Some(Notification::warning(
+                        "Cookie validation stopped",
+                        "Starting an anonymous session.",
+                    ));
+                } else {
+                    self.home_error = Some("The background task stopped unexpectedly.".to_owned());
+                    self.notification = Some(Notification::error(
+                        "Initialization failed",
+                        "The background task stopped unexpectedly.",
+                    ));
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn poll_authentication(&mut self) {
+        let Some(receiver) = &self.auth_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok((ytmusic, identity, credentials))) => {
+                self.auth_receiver = None;
+                if let Err(error) = credentials.save() {
+                    self.notification = Some(Notification::error("Cookie not saved", error));
+                    return;
+                }
+                self.has_credentials = true;
+                self.account_identity = Some(identity);
+                self.activate_client(ytmusic);
+                self.notification = Some(Notification::success(
+                    "Signed in",
+                    "Your YouTube Music account is connected.",
+                ));
+            }
+            Ok(Err(error)) => {
+                self.auth_receiver = None;
                 self.notification = Some(Notification::error(
-                    "Initialization failed",
+                    "Cookie not accepted",
                     error.to_string(),
                 ));
             }
             Err(TryRecvError::Disconnected) => {
-                self.init_receiver = None;
-                self.home_error = Some("The background task stopped unexpectedly.".to_owned());
+                self.auth_receiver = None;
                 self.notification = Some(Notification::error(
-                    "Initialization failed",
-                    "The background task stopped unexpectedly.",
+                    "Sign-in failed",
+                    "The validation task stopped unexpectedly.",
                 ));
             }
             Err(TryRecvError::Empty) => {}
         }
+    }
+
+    fn activate_client(&mut self, ytmusic: YTMusic) {
+        let home_client = ytmusic.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(home_client.get_home().await);
+        });
+        self.ytmusic = Some(ytmusic);
+        self.home_shelves.clear();
+        self.home_shelf = 0;
+        self.home_state.select(None);
+        self.home_error = None;
+        self.home_receiver = Some(receiver);
+        self.search_receiver = None;
+        self.play_receiver = None;
+    }
+
+    fn start_initialization(&mut self, cookie: Option<String>) {
+        let has_cookie = cookie.is_some();
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(initialize_client(cookie).await);
+        });
+        self.ytmusic = None;
+        self.init_receiver = Some(receiver);
+        self.init_with_cookie = has_cookie;
+        self.home_receiver = None;
+        self.home_shelves.clear();
+        self.home_state.select(None);
+        self.home_error = None;
+        self.search_receiver = None;
+        self.play_receiver = None;
     }
 
     fn poll_home(&mut self) {
@@ -408,6 +657,103 @@ impl App {
     }
     fn is_home_list(&self) -> bool {
         self.nav.selected() == Some(0)
+    }
+
+    fn is_settings(&self) -> bool {
+        self.nav.selected() == Some(2)
+    }
+
+    fn accent_color(&self) -> Color {
+        ACCENT_COLORS[self.settings_state.selected().unwrap_or(DEFAULT_ACCENT)].color()
+    }
+
+    fn previous_accent(&mut self) {
+        let selected = self.settings_state.selected().unwrap_or(DEFAULT_ACCENT);
+        self.select_accent(selected.saturating_sub(1));
+    }
+
+    fn next_accent(&mut self) {
+        let selected = self.settings_state.selected().unwrap_or(DEFAULT_ACCENT);
+        self.select_accent((selected + 1).min(ACCENT_COLORS.len() - 1));
+    }
+
+    fn select_accent(&mut self, index: usize) {
+        self.settings_state.select(Some(index));
+        self.config.accent = ACCENT_COLORS[index].name.to_owned();
+        if let Err(error) = self.config.save() {
+            self.notification = Some(Notification::warning("Config not saved", error));
+        }
+    }
+
+    fn open_cookie_input(&mut self) {
+        if self.auth_receiver.is_some() {
+            self.notification = Some(Notification::info(
+                "Validating cookie",
+                "Wait for the current sign-in attempt to finish.",
+            ));
+            return;
+        }
+        self.cookie_input = Some(String::new());
+    }
+
+    fn append_cookie_input(&mut self, text: &str) {
+        let Some(input) = &mut self.cookie_input else {
+            return;
+        };
+        let remaining = (16_usize * 1024).saturating_sub(input.len());
+        input.extend(text.chars().take(remaining));
+    }
+
+    fn submit_cookie(&mut self) {
+        let Some(input) = self.cookie_input.take() else {
+            return;
+        };
+        let credentials = match Credentials::new(&input) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                self.notification = Some(Notification::warning("Invalid cookie", error));
+                return;
+            }
+        };
+        let cookie = credentials.cookie().to_owned();
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let result = async {
+                let ytmusic = YTMusic::new(Some(cookie)).await?;
+                let identity = ytmusic.account_identity().await?;
+                Ok((ytmusic, identity, credentials))
+            }
+            .await;
+            let _ = sender.send(result);
+        });
+        self.auth_receiver = Some(receiver);
+        self.notification = Some(Notification::info(
+            "Validating cookie",
+            "Checking your YouTube Music account...",
+        ));
+    }
+
+    fn remove_cookie(&mut self) {
+        if !self.has_credentials && self.account_identity.is_none() {
+            self.notification = Some(Notification::info(
+                "Not signed in",
+                "There is no saved cookie to remove.",
+            ));
+            return;
+        }
+        if let Err(error) = Credentials::remove() {
+            self.notification = Some(Notification::error("Cookie not removed", error));
+            return;
+        }
+        self.auth_receiver = None;
+        self.cookie_input = None;
+        self.has_credentials = false;
+        self.account_identity = None;
+        self.start_initialization(None);
+        self.notification = Some(Notification::success(
+            "Signed out",
+            "The local browser cookie was removed.",
+        ));
     }
 
     fn previous_home(&mut self) {

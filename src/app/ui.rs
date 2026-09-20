@@ -20,6 +20,7 @@ impl App {
             Screen::Player => self.render_player_screen(frame),
         }
         self.render_notification(frame);
+        self.render_cookie_modal(frame);
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
@@ -64,6 +65,8 @@ impl App {
         }
         let help_text = if self.search_editing {
             " type query  Enter: search  Esc: cancel "
+        } else if self.cookie_input.is_some() {
+            " paste browser cookie  Enter: validate  Esc: cancel "
         } else if self.focus == Focus::Nav {
             " j/k: navigate  l/Enter: content  /: search  P: player  q: quit "
         } else if self.is_home_list() {
@@ -71,7 +74,7 @@ impl App {
         } else if self.is_search_list() {
             " j/k: select  Enter: play  /: search  Space: pause  P: player  Esc: navigation "
         } else if self.is_settings() {
-            " h/l: preview accent  Esc: navigation  q: quit "
+            " j/k: setting  h/l: change  Enter: select  d: remove cookie  Esc: navigation "
         } else {
             " Space: pause  [/] seek  n/p: track  P: player  Esc: navigation "
         };
@@ -185,6 +188,7 @@ impl App {
     fn render_settings(&mut self, frame: &mut Frame, area: Rect) {
         let accent = self.accent_color();
         let is_focused = self.focus == Focus::Content;
+        let appearance_focused = is_focused && self.settings_row == 0;
         let container = Block::default()
             .title(" Settings ")
             .title_style(Style::default().add_modifier(Modifier::BOLD))
@@ -208,7 +212,11 @@ impl App {
                 Span::styled(
                     header,
                     Style::default()
-                        .fg(if is_focused { accent } else { Color::DarkGray })
+                        .fg(if appearance_focused {
+                            accent
+                        } else {
+                            Color::DarkGray
+                        })
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(rule, Style::default().fg(Color::DarkGray)),
@@ -221,7 +229,7 @@ impl App {
         let option_lines = accent_option_lines(
             setting_width.saturating_sub(5),
             selected,
-            is_focused,
+            appearance_focused,
             accent,
         );
         let setting_height = u16::try_from(option_lines.len())
@@ -236,7 +244,11 @@ impl App {
         );
         let setting_block = Block::default()
             .borders(Borders::LEFT)
-            .border_style(Style::default().fg(if is_focused { accent } else { Color::DarkGray }))
+            .border_style(Style::default().fg(if appearance_focused {
+                accent
+            } else {
+                Color::DarkGray
+            }))
             .padding(Padding::horizontal(2));
         let setting_inner = setting_block.inner(setting_area);
         frame.render_widget(setting_block, setting_area);
@@ -245,7 +257,11 @@ impl App {
             "Accent Color",
             Style::default()
                 .fg(if is_focused {
-                    Color::White
+                    if appearance_focused {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    }
                 } else {
                     Color::Gray
                 })
@@ -263,6 +279,100 @@ impl App {
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: true }),
             setting_inner,
+        );
+
+        let account_header_y = setting_area.bottom().saturating_add(1);
+        if account_header_y >= inner.bottom() {
+            return;
+        }
+        let account_focused = is_focused && self.settings_row == 1;
+        let account_header = "ACCOUNT ";
+        let account_rule =
+            "─".repeat(usize::from(inner.width).saturating_sub(account_header.chars().count()));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    account_header,
+                    Style::default()
+                        .fg(if account_focused {
+                            accent
+                        } else {
+                            Color::DarkGray
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(account_rule, Style::default().fg(Color::DarkGray)),
+            ])),
+            Rect::new(inner.x, account_header_y, inner.width, 1),
+        );
+
+        let account_y = account_header_y.saturating_add(2);
+        let account_area = Rect::new(
+            inner.x,
+            account_y,
+            setting_width,
+            inner.bottom().saturating_sub(account_y),
+        );
+        let account_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(if account_focused {
+                accent
+            } else {
+                Color::DarkGray
+            }))
+            .padding(Padding::horizontal(2));
+        let account_inner = account_block.inner(account_area);
+        frame.render_widget(account_block, account_area);
+
+        let title_style = Style::default()
+            .fg(if account_focused {
+                Color::White
+            } else {
+                Color::Gray
+            })
+            .add_modifier(Modifier::BOLD);
+        let mut account_lines = vec![Line::styled("YouTube Music Account", title_style)];
+        if self.auth_receiver.is_some() {
+            account_lines.push(Line::styled(
+                format!("{}  Validating browser cookie...", self.spinner_frame()),
+                Style::default().fg(accent),
+            ));
+        } else if let Some(identity) = &self.account_identity {
+            account_lines.push(Line::from(vec![
+                Span::styled("Signed in as: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(match &identity.username {
+                    Some(username) => format!("{} ({username})", identity.display_name),
+                    None => identity.display_name.clone(),
+                }),
+            ]));
+        } else if self.has_credentials {
+            account_lines.push(Line::styled(
+                "Saved cookie needs to be replaced",
+                Style::default().fg(Color::Yellow),
+            ));
+        } else {
+            account_lines.push(Line::styled(
+                "Not signed in",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        account_lines.push(Line::styled(
+            "[Enter] paste browser cookie",
+            Style::default().fg(if account_focused {
+                accent
+            } else {
+                Color::DarkGray
+            }),
+        ));
+        if self.has_credentials || self.account_identity.is_some() {
+            account_lines.push(Line::styled(
+                "[d] remove local cookie",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(account_lines).wrap(Wrap { trim: true }),
+            account_inner,
         );
     }
 
@@ -731,6 +841,74 @@ impl App {
                     .border_style(
                         Style::default().fg(notification.color.unwrap_or(self.accent_color())),
                     )
+                    .padding(Padding::horizontal(1)),
+            ),
+            popup,
+        );
+    }
+
+    fn render_cookie_modal(&self, frame: &mut Frame) {
+        let Some(input) = &self.cookie_input else {
+            return;
+        };
+        let area = frame.area();
+        if area.width < 32 || area.height < 10 {
+            return;
+        }
+        let width = area.width.saturating_sub(4).min(76);
+        let height = area.height.saturating_sub(2).min(13);
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        let input_status = if input.is_empty() {
+            "Waiting for paste...".to_owned()
+        } else {
+            format!("{} characters captured", input.len())
+        };
+        let lines = vec![
+            Line::styled(
+                "1. Sign in at music.youtube.com",
+                Style::default().fg(Color::Gray),
+            ),
+            Line::styled(
+                "2. Open Developer Tools > Network and reload",
+                Style::default().fg(Color::Gray),
+            ),
+            Line::styled(
+                "3. Open a youtubei/v1/browse request",
+                Style::default().fg(Color::Gray),
+            ),
+            Line::styled(
+                "4. Copy the complete Cookie request-header value",
+                Style::default().fg(Color::Gray),
+            ),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("Input: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(input_status, Style::default().fg(self.accent_color())),
+            ]),
+            Line::styled(
+                "The cookie is hidden and will be saved with owner-only permissions.",
+                Style::default().fg(Color::Yellow),
+            ),
+            Line::default(),
+            Line::styled(
+                "Enter: validate and save    Esc: cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+                Block::default()
+                    .title(" Browser Cookie Sign-In ")
+                    .title_style(Style::default().add_modifier(Modifier::BOLD))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(self.accent_color()))
                     .padding(Padding::horizontal(1)),
             ),
             popup,

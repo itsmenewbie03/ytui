@@ -10,6 +10,7 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 ## ✨ Features
 
 - Browse YouTube Music home shelves
+- Sign in with a browser cookie for personalized account data
 - Search for songs, videos, albums, artists, and playlists
 - Play the highest-quality available audio stream through `mpv`
 - Pause, seek, and move through the current queue
@@ -69,6 +70,12 @@ ytui
 
 Once it opens, choose a home item or press `/`, type a search, and press `Enter` to start listening.
 
+## 🔐 Optional Sign-In
+
+Open **Settings**, select **YouTube Music Account**, and press `Enter`. The dialog explains how to copy the `Cookie` request-header value from a signed-in `music.youtube.com` browser session. ytui validates the cookie before saving it to `$XDG_CONFIG_HOME/ytui/credentials` with owner-only permissions on Unix.
+
+Treat this file like a password: the cookie grants access to your YouTube account. Press `d` on the account setting to remove the local cookie and return to an anonymous session.
+
 ## ⌨️ Controls
 
 ### 🧭 Navigation
@@ -82,6 +89,8 @@ Once it opens, choose a home item or press `/`, type a search, and press `Enter`
 | `Esc` | Cancel input, return to navigation, or leave the player |
 | `P` | Open or close the full player |
 | `q` | Quit |
+
+In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to open it, and `d` to remove a saved account cookie.
 
 ### 🎵 Playback
 

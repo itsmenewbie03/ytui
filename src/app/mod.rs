@@ -150,6 +150,7 @@ struct App {
     player: Option<MpvPlayer>,
     playback: PlaybackState,
     notification: Option<Notification>,
+    quit_confirmation: bool,
     search_query: String,
     search_editing: bool,
     search_items: Vec<SearchItem>,
@@ -209,6 +210,7 @@ impl App {
             playback: PlaybackState::default(),
             notification: config_warning
                 .map(|error| Notification::warning("Config not loaded", error)),
+            quit_confirmation: false,
             search_query: String::new(),
             search_editing: false,
             search_items: Vec::new(),
@@ -246,7 +248,15 @@ impl App {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if self.cookie_input.is_some() {
+                if self.quit_confirmation {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') => return Ok(()),
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                            self.quit_confirmation = false;
+                        }
+                        _ => {}
+                    }
+                } else if self.cookie_input.is_some() {
                     match key.code {
                         KeyCode::Enter => self.submit_cookie(),
                         KeyCode::Esc => self.cookie_input = None,
@@ -276,7 +286,7 @@ impl App {
                     }
                 } else if self.screen == Screen::Player {
                     match key.code {
-                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Char('q') => self.quit_confirmation = true,
                         KeyCode::Esc | KeyCode::Char('P') => self.screen = Screen::Main,
                         KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
                             self.previous_player_tab();
@@ -316,7 +326,7 @@ impl App {
                     self.search_editing = true;
                 } else if self.focus == Focus::Content {
                     match key.code {
-                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Char('q') => self.quit_confirmation = true,
                         KeyCode::Esc => self.focus = Focus::Nav,
                         KeyCode::Left | KeyCode::Char('h') if self.is_home_list() => {
                             self.previous_home_shelf();
@@ -370,7 +380,7 @@ impl App {
                     }
                 } else {
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('q') | KeyCode::Esc => self.quit_confirmation = true,
                         KeyCode::Up | KeyCode::Char('k') => self.previous_nav(),
                         KeyCode::Down | KeyCode::Char('j') => self.next_nav(),
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {

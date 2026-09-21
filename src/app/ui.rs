@@ -19,6 +19,7 @@ impl App {
         }
         self.render_notification(frame);
         self.render_cookie_modal(frame);
+        self.render_quit_confirmation(frame);
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
@@ -955,6 +956,47 @@ impl App {
             Paragraph::new(lines).wrap(Wrap { trim: true }).block(
                 Block::default()
                     .title(title)
+                    .title_style(Style::default().add_modifier(Modifier::BOLD))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(self.accent_color()))
+                    .padding(Padding::horizontal(1)),
+            ),
+            popup,
+        );
+    }
+
+    fn render_quit_confirmation(&self, frame: &mut Frame) {
+        if !self.quit_confirmation {
+            return;
+        }
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(46);
+        let height = area.height.saturating_sub(2).min(7);
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        let lines = vec![
+            Line::styled(
+                "Quit ytui and stop playback?",
+                Style::default().fg(Color::White),
+            ),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("Enter/y", Style::default().fg(self.accent_color()).bold()),
+                Span::styled(" quit    ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc/n", Style::default().fg(Color::Gray).bold()),
+                Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).alignment(Alignment::Center).block(
+                Block::default()
+                    .title(" Confirm Quit ")
                     .title_style(Style::default().add_modifier(Modifier::BOLD))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)

@@ -88,6 +88,10 @@ ytui keeps only cookies applicable to `music.youtube.com`, validates the account
 
 Treat both files like passwords: the cookies grant access to your YouTube account. Press `d` on the account setting to remove the local credential and return to an anonymous session. Be careful with similarly named browser extensions: yt-dlp specifically warns against the old **Get cookies.txt** extension, which was reported as malware.
 
+### 🎥 Optional Watch History Sync
+
+When signed in, open **Settings**, move to **Playback**, and toggle **Sync watch history** (`h` / `l` / `Enter`) to report plays to your YouTube Music account. This keeps your watch history and personalized recommendations in sync. It is off by default, and playback otherwise remains anonymous.
+
 ## ⌨️ Controls
 
 ### 🧭 Navigation
@@ -102,7 +106,7 @@ Treat both files like passwords: the cookies grant access to your YouTube accoun
 | `P` | Open or close the full player |
 | `q` | Quit |
 
-In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to import `cookies.txt`, `c` to paste a raw cookie header, and `d` to remove a saved account cookie.
+In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to import `cookies.txt`, `c` to paste a raw cookie header, and `d` to remove a saved account cookie. In the **Playback** section, `h` / `l` / `Enter` toggle watch history sync.
 
 ### 🎵 Playback
 

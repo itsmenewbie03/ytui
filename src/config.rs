@@ -15,12 +15,14 @@ const DEFAULT_ACCENT: &str = "Sky";
 #[serde(default)]
 pub struct Config {
     pub accent: String,
+    pub watch_history: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             accent: DEFAULT_ACCENT.to_owned(),
+            watch_history: false,
         }
     }
 }
@@ -278,6 +280,7 @@ mod tests {
     fn missing_fields_use_defaults() {
         let config = toml::from_str::<Config>("").expect("empty config should use defaults");
         assert_eq!(config.accent, DEFAULT_ACCENT);
+        assert!(!config.watch_history, "watch history should be opt-in");
     }
 
     #[test]

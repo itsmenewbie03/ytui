@@ -1,3 +1,4 @@
+use crate::scraper::ytmusic::WatchTracking;
 use innertube_rs::{MusicHomeFeed, MusicSearchResults};
 use ratatui::style::Color;
 use std::time::{Duration, Instant};
@@ -134,8 +135,8 @@ pub(super) struct PlaybackState {
     pub(super) diagnostics: Vec<String>,
     pub(super) stream_url: Option<String>,
     pub(super) stream_copied: bool,
+    pub(super) watch_tracking: Option<WatchTracking>,
 }
-
 #[derive(Default)]
 pub(super) enum PlaybackStatus {
     #[default]

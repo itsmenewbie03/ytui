@@ -7,7 +7,7 @@ use self::model::{
     SearchItem, home_shelves, search_items,
 };
 use self::mpris::{MprisCommand, MprisService, MprisSnapshot};
-use crate::config::{Config, Credentials};
+use crate::config::{Config, Credentials, MiniPlayerLayout};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
 use crate::scraper::ytmusic::{AccountIdentity, AudioStreamInfo, UpNextQueue, YTMusic};
 use color_eyre::eyre::{Context, Result};
@@ -362,6 +362,8 @@ impl App {
                                 self.previous_accent();
                             } else if self.settings_row == 2 {
                                 self.toggle_watch_history();
+                            } else if self.settings_row == 3 {
+                                self.toggle_mini_player_layout();
                             } else {
                                 self.focus = Focus::Nav;
                             }
@@ -375,6 +377,11 @@ impl App {
                             if self.is_settings() && self.settings_row == 2 =>
                         {
                             self.toggle_watch_history();
+                        }
+                        KeyCode::Right | KeyCode::Char('l')
+                            if self.is_settings() && self.settings_row == 3 =>
+                        {
+                            self.toggle_mini_player_layout();
                         }
                         KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Nav,
                         KeyCode::Up | KeyCode::Char('k') if self.is_home_list() => {
@@ -393,7 +400,7 @@ impl App {
                             self.next_search();
                         }
                         KeyCode::Down | KeyCode::Char('j') if self.is_settings() => {
-                            self.settings_row = (self.settings_row + 1).min(2);
+                            self.settings_row = (self.settings_row + 1).min(3);
                         }
                         KeyCode::Enter if self.is_home_list() => self.select_home_item(),
                         KeyCode::Enter if self.is_search_list() => self.select_search_item(),
@@ -402,6 +409,9 @@ impl App {
                         }
                         KeyCode::Enter if self.is_settings() && self.settings_row == 2 => {
                             self.toggle_watch_history();
+                        }
+                        KeyCode::Enter if self.is_settings() && self.settings_row == 3 => {
+                            self.toggle_mini_player_layout();
                         }
                         KeyCode::Char('c') if self.is_settings() && self.settings_row == 1 => {
                             self.open_cookie_input(CookieInputKind::Header);
@@ -924,6 +934,25 @@ impl App {
             "Playback is no longer reported to your watch history."
         };
         self.notification = Some(Notification::info("Watch history", message));
+    }
+
+    fn toggle_mini_player_layout(&mut self) {
+        self.config.mini_player_layout = match self.config.mini_player_layout {
+            MiniPlayerLayout::Standard => MiniPlayerLayout::Compact,
+            MiniPlayerLayout::Compact => MiniPlayerLayout::Standard,
+        };
+        if let Err(error) = self.config.save() {
+            self.notification = Some(Notification::warning("Config not saved", error));
+            return;
+        }
+        let layout = match self.config.mini_player_layout {
+            MiniPlayerLayout::Standard => "Standard",
+            MiniPlayerLayout::Compact => "Compact",
+        };
+        self.notification = Some(Notification::info(
+            "Mini player",
+            format!("Using the {layout} layout."),
+        ));
     }
 
     fn open_cookie_input(&mut self, kind: CookieInputKind) {

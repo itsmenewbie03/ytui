@@ -11,11 +11,20 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const DEFAULT_ACCENT: &str = "Sky";
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiniPlayerLayout {
+    #[default]
+    Standard,
+    Compact,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub accent: String,
     pub watch_history: bool,
+    pub mini_player_layout: MiniPlayerLayout,
 }
 
 impl Default for Config {
@@ -23,6 +32,7 @@ impl Default for Config {
         Self {
             accent: DEFAULT_ACCENT.to_owned(),
             watch_history: false,
+            mini_player_layout: MiniPlayerLayout::Standard,
         }
     }
 }
@@ -281,6 +291,15 @@ mod tests {
         let config = toml::from_str::<Config>("").expect("empty config should use defaults");
         assert_eq!(config.accent, DEFAULT_ACCENT);
         assert!(!config.watch_history, "watch history should be opt-in");
+        assert_eq!(config.mini_player_layout, MiniPlayerLayout::Standard);
+    }
+
+    #[test]
+    fn parses_compact_mini_player_layout() {
+        let config = toml::from_str::<Config>("mini_player_layout = \"compact\"")
+            .expect("compact layout should parse");
+
+        assert_eq!(config.mini_player_layout, MiniPlayerLayout::Compact);
     }
 
     #[test]

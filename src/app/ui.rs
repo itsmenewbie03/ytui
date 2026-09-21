@@ -1,5 +1,6 @@
 use super::{ACCENT_COLORS, App, CookieInputKind, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES};
 use crate::app::model::{Focus, NotificationMode, PlaybackStatus, Screen};
+use crate::config::MiniPlayerLayout;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -10,6 +11,16 @@ use ratatui::{
         Wrap,
     },
 };
+
+const COMPACT_MINI_PLAYER_WIDTH: u16 = 100;
+const MINIMAL_MINI_PLAYER_WIDTH: u16 = 56;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MiniPlayerMode {
+    Standard,
+    Compact,
+    Minimal,
+}
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame) {
@@ -24,7 +35,12 @@ impl App {
 
     fn render_main(&mut self, frame: &mut Frame) {
         let accent = self.accent_color();
-        let mini_height = u16::from(self.playback.track.is_some()) * 5;
+        let mini_player_mode = self
+            .playback
+            .track
+            .as_ref()
+            .map(|_| mini_player_mode(self.config.mini_player_layout, frame.area().width));
+        let mini_height = mini_player_mode.map_or(0, mini_player_height);
         let [body, mini_player, help] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -59,8 +75,8 @@ impl App {
         frame.render_stateful_widget(nav, nav_area, &mut self.nav);
 
         self.render_main_content(frame, workspace);
-        if mini_height > 0 {
-            self.render_mini_player(frame, mini_player);
+        if let Some(mode) = mini_player_mode {
+            self.render_mini_player(frame, mini_player, mode);
         }
         let help_text = if self.search_editing {
             " type query  Enter: search  Esc: cancel "
@@ -376,7 +392,9 @@ impl App {
         if playback_header_y >= inner.bottom() {
             return;
         }
-        let playback_focused = is_focused && self.settings_row == 2;
+        let playback_focused = is_focused && matches!(self.settings_row, 2 | 3);
+        let watch_history_focused = is_focused && self.settings_row == 2;
+        let mini_player_focused = is_focused && self.settings_row == 3;
         let playback_header = "PLAYBACK ";
         let playback_rule =
             "─".repeat(usize::from(inner.width).saturating_sub(playback_header.chars().count()));
@@ -422,7 +440,7 @@ impl App {
                 } else {
                     "○ "
                 },
-                Style::default().fg(if playback_focused {
+                Style::default().fg(if watch_history_focused {
                     accent
                 } else {
                     Color::DarkGray
@@ -431,7 +449,7 @@ impl App {
             Span::styled(
                 "Sync watch history",
                 Style::default()
-                    .fg(if playback_focused {
+                    .fg(if watch_history_focused {
                         Color::White
                     } else {
                         Color::Gray
@@ -446,11 +464,35 @@ impl App {
             ));
         }
         playback_lines.push(Line::styled(
-            "Report plays to your YouTube Music account so watch history and",
+            "Report plays to YouTube Music. [←] [→] [Enter] toggle",
             Style::default().fg(Color::DarkGray),
         ));
+        playback_lines.push(Line::from(vec![
+            Span::styled(
+                if self.config.mini_player_layout == MiniPlayerLayout::Compact {
+                    "● "
+                } else {
+                    "○ "
+                },
+                Style::default().fg(if mini_player_focused {
+                    accent
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled(
+                "Compact mini player",
+                Style::default()
+                    .fg(if mini_player_focused {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
         playback_lines.push(Line::styled(
-            "recommendations stay in sync. [←] [→] [Enter] toggle",
+            "Always use the dense layout. [←] [→] [Enter] toggle",
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(
@@ -459,7 +501,7 @@ impl App {
         );
     }
 
-    fn render_mini_player(&self, frame: &mut Frame, area: Rect) {
+    fn render_mini_player(&self, frame: &mut Frame, area: Rect, mode: MiniPlayerMode) {
         let Some(track) = &self.playback.track else {
             return;
         };
@@ -472,92 +514,171 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let strip_style = Style::default().fg(Color::Gray);
-        let [transport_area, track_area, time_area, actions_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(25),
-                Constraint::Min(28),
-                Constraint::Length(42),
-                Constraint::Length(22),
-            ])
-            .areas(inner);
         let play_icon = if matches!(self.playback.status, PlaybackStatus::Paused) {
             ""
         } else {
             ""
         };
         let control_style = strip_style.fg(accent).add_modifier(Modifier::BOLD);
-        let transport_row = Rect::new(
-            transport_area.x,
-            transport_area.y + transport_area.height / 2,
-            transport_area.width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!("󰒮   {play_icon}   󰒭"), control_style))
-                .alignment(Alignment::Center)
-                .style(strip_style),
-            transport_row,
-        );
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    track.title.clone(),
-                    strip_style.add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(track.artist.clone(), strip_style.fg(Color::DarkGray)),
-                Line::styled(
-                    format!(
-                        "{} views  {} likes",
-                        format_count(track.views),
-                        format_count(track.likes)
-                    ),
-                    strip_style.fg(Color::DarkGray),
-                ),
-            ])
-            .style(strip_style),
-            track_area,
-        );
-        let progress_row = Rect::new(
-            time_area.x,
-            time_area.y + time_area.height / 2,
-            time_area.width,
-            1,
-        );
-        let [gauge_area, timestamp_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(8), Constraint::Length(15)])
-            .areas(progress_row);
-        frame.render_widget(
-            LineGauge::default()
-                .ratio(self.playback_ratio())
-                .filled_style(Style::default().fg(accent))
-                .unfilled_style(Style::default().fg(Color::DarkGray))
-                .label(""),
-            gauge_area,
-        );
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{} / {}",
-                format_time(self.playback.position),
-                format_time(self.playback.duration)
-            ))
-            .alignment(Alignment::Right)
-            .style(strip_style.fg(accent)),
-            timestamp_area,
-        );
-        let actions_row = Rect::new(
-            actions_area.x,
-            actions_area.y + actions_area.height / 2,
-            actions_area.width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new("[ -10s  +10s ]   P")
-                .alignment(Alignment::Center)
-                .style(strip_style),
-            actions_row,
-        );
+        match mode {
+            MiniPlayerMode::Standard => {
+                let [transport_area, track_area, time_area, actions_area] = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(15),
+                        Constraint::Min(20),
+                        Constraint::Length(30),
+                        Constraint::Length(17),
+                    ])
+                    .areas(inner);
+                let transport_row = Rect::new(
+                    transport_area.x,
+                    transport_area.y + transport_area.height / 2,
+                    transport_area.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::styled(format!("󰒮  {play_icon}  󰒭"), control_style))
+                        .alignment(Alignment::Center),
+                    transport_row,
+                );
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::styled(
+                            track.title.clone(),
+                            strip_style.add_modifier(Modifier::BOLD),
+                        ),
+                        Line::styled(track.artist.clone(), strip_style.fg(Color::DarkGray)),
+                        Line::styled(
+                            format!(
+                                "{} views  {} likes",
+                                format_count(track.views),
+                                format_count(track.likes)
+                            ),
+                            strip_style.fg(Color::DarkGray),
+                        ),
+                    ]),
+                    track_area,
+                );
+                let progress_row = Rect::new(
+                    time_area.x,
+                    time_area.y + time_area.height / 2,
+                    time_area.width,
+                    1,
+                );
+                let [gauge_area, timestamp_area] = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(8), Constraint::Length(15)])
+                    .areas(progress_row);
+                frame.render_widget(
+                    LineGauge::default()
+                        .ratio(self.playback_ratio())
+                        .filled_style(Style::default().fg(accent))
+                        .unfilled_style(Style::default().fg(Color::DarkGray))
+                        .label(""),
+                    gauge_area,
+                );
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "{} / {}",
+                        format_time(self.playback.position),
+                        format_time(self.playback.duration)
+                    ))
+                    .alignment(Alignment::Right)
+                    .style(strip_style.fg(accent)),
+                    timestamp_area,
+                );
+                let actions_row = Rect::new(
+                    actions_area.x,
+                    actions_area.y + actions_area.height / 2,
+                    actions_area.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new("[-10s  +10s]  P")
+                        .alignment(Alignment::Center)
+                        .style(strip_style),
+                    actions_row,
+                );
+            }
+            MiniPlayerMode::Compact => {
+                let [transport_area, track_area, time_area] = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(11),
+                        Constraint::Min(12),
+                        Constraint::Length(26),
+                    ])
+                    .areas(inner);
+                frame.render_widget(
+                    Paragraph::new(Line::styled(format!("󰒮 {play_icon} 󰒭"), control_style))
+                        .alignment(Alignment::Center),
+                    transport_area,
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            track.title.clone(),
+                            strip_style.add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  ·  {}", track.artist),
+                            strip_style.fg(Color::DarkGray),
+                        ),
+                    ])),
+                    track_area,
+                );
+                let [gauge_area, timestamp_area] = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(6), Constraint::Length(13)])
+                    .areas(time_area);
+                frame.render_widget(
+                    LineGauge::default()
+                        .ratio(self.playback_ratio())
+                        .filled_style(Style::default().fg(accent))
+                        .unfilled_style(Style::default().fg(Color::DarkGray))
+                        .label(""),
+                    gauge_area,
+                );
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "{} / {}",
+                        format_time(self.playback.position),
+                        format_time(self.playback.duration)
+                    ))
+                    .alignment(Alignment::Right)
+                    .style(strip_style.fg(accent)),
+                    timestamp_area,
+                );
+            }
+            MiniPlayerMode::Minimal => {
+                let [control_area, track_area, time_area] = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(5),
+                        Constraint::Min(4),
+                        Constraint::Length(8),
+                    ])
+                    .areas(inner);
+                frame.render_widget(
+                    Paragraph::new(play_icon)
+                        .alignment(Alignment::Center)
+                        .style(control_style),
+                    control_area,
+                );
+                frame.render_widget(
+                    Paragraph::new(track.title.as_str())
+                        .style(strip_style.add_modifier(Modifier::BOLD)),
+                    track_area,
+                );
+                frame.render_widget(
+                    Paragraph::new(format_time(self.playback.position))
+                        .alignment(Alignment::Right)
+                        .style(strip_style.fg(accent)),
+                    time_area,
+                );
+            }
+        }
     }
 
     fn render_player_screen(&mut self, frame: &mut Frame) {
@@ -1092,6 +1213,23 @@ impl App {
     }
 }
 
+fn mini_player_mode(layout: MiniPlayerLayout, width: u16) -> MiniPlayerMode {
+    if width < MINIMAL_MINI_PLAYER_WIDTH {
+        MiniPlayerMode::Minimal
+    } else if layout == MiniPlayerLayout::Compact || width < COMPACT_MINI_PLAYER_WIDTH {
+        MiniPlayerMode::Compact
+    } else {
+        MiniPlayerMode::Standard
+    }
+}
+
+const fn mini_player_height(mode: MiniPlayerMode) -> u16 {
+    match mode {
+        MiniPlayerMode::Standard => 5,
+        MiniPlayerMode::Compact | MiniPlayerMode::Minimal => 3,
+    }
+}
+
 fn trim_with_ellipsis(message: &str, max_width: usize) -> String {
     let characters = message.chars().collect::<Vec<_>>();
     if characters.len() <= max_width {
@@ -1331,5 +1469,29 @@ mod tests {
         assert_eq!(format_count(Some(6_900)), "6.9k");
         assert_eq!(format_count(Some(2_000_000)), "2m");
         assert_eq!(format_count(None), "—");
+    }
+
+    #[test]
+    fn adapts_standard_mini_player_to_terminal_width() {
+        assert_eq!(
+            mini_player_mode(MiniPlayerLayout::Standard, 120),
+            MiniPlayerMode::Standard
+        );
+        assert_eq!(
+            mini_player_mode(MiniPlayerLayout::Standard, 80),
+            MiniPlayerMode::Compact
+        );
+        assert_eq!(
+            mini_player_mode(MiniPlayerLayout::Standard, 40),
+            MiniPlayerMode::Minimal
+        );
+    }
+
+    #[test]
+    fn compact_preference_uses_dense_layout_at_wide_widths() {
+        let mode = mini_player_mode(MiniPlayerLayout::Compact, 120);
+
+        assert_eq!(mode, MiniPlayerMode::Compact);
+        assert_eq!(mini_player_height(mode), 3);
     }
 }

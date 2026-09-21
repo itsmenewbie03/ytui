@@ -106,7 +106,7 @@ When signed in, open **Settings**, move to **Playback**, and toggle **Sync watch
 | `P` | Open or close the full player |
 | `q` | Quit |
 
-In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to import `cookies.txt`, `c` to paste a raw cookie header, and `d` to remove a saved account cookie. In the **Playback** section, `h` / `l` / `Enter` toggle watch history sync.
+In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to import `cookies.txt`, `c` to paste a raw cookie header, and `d` to remove a saved account cookie. In the **Playback** section, `h` / `l` / `Enter` toggle watch history sync and the compact mini-player layout. The standard mini player also collapses automatically when the terminal becomes narrow.
 
 ### 🎵 Playback
 

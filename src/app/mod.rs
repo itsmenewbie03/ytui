@@ -70,6 +70,12 @@ impl AccentColor {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CookieInputKind {
+    NetscapeFile,
+    Header,
+}
+
 pub fn run() -> Result<()> {
     let runtime = Runtime::new().wrap_err("failed to create async runtime")?;
     let (config, config_warning) = match Config::load() {
@@ -130,6 +136,7 @@ struct App {
     init_with_cookie: bool,
     auth_receiver: Option<Receiver<AuthRequestResult>>,
     cookie_input: Option<String>,
+    cookie_input_kind: CookieInputKind,
     has_credentials: bool,
     account_identity: Option<AccountIdentity>,
     home_receiver: Option<Receiver<innertube_rs::error::Result<MusicHomeFeed>>>,
@@ -187,6 +194,7 @@ impl App {
             init_with_cookie: has_credentials,
             auth_receiver: None,
             cookie_input: None,
+            cookie_input_kind: CookieInputKind::NetscapeFile,
             has_credentials,
             account_identity: None,
             home_receiver: None,
@@ -350,7 +358,10 @@ impl App {
                         KeyCode::Enter if self.is_home_list() => self.select_home_item(),
                         KeyCode::Enter if self.is_search_list() => self.select_search_item(),
                         KeyCode::Enter if self.is_settings() && self.settings_row == 1 => {
-                            self.open_cookie_input();
+                            self.open_cookie_input(CookieInputKind::NetscapeFile);
+                        }
+                        KeyCode::Char('c') if self.is_settings() && self.settings_row == 1 => {
+                            self.open_cookie_input(CookieInputKind::Header);
                         }
                         KeyCode::Char('d') if self.is_settings() && self.settings_row == 1 => {
                             self.remove_cookie();
@@ -759,7 +770,7 @@ impl App {
         }
     }
 
-    fn open_cookie_input(&mut self) {
+    fn open_cookie_input(&mut self, kind: CookieInputKind) {
         if self.auth_receiver.is_some() {
             self.notification = Some(Notification::info(
                 "Validating cookie",
@@ -767,6 +778,7 @@ impl App {
             ));
             return;
         }
+        self.cookie_input_kind = kind;
         self.cookie_input = Some(String::new());
     }
 
@@ -782,10 +794,14 @@ impl App {
         let Some(input) = self.cookie_input.take() else {
             return;
         };
-        let credentials = match Credentials::new(&input) {
+        let credentials = match self.cookie_input_kind {
+            CookieInputKind::NetscapeFile => Credentials::from_netscape_file(&input),
+            CookieInputKind::Header => Credentials::new(&input),
+        };
+        let credentials = match credentials {
             Ok(credentials) => credentials,
             Err(error) => {
-                self.notification = Some(Notification::warning("Invalid cookie", error));
+                self.notification = Some(Notification::warning("Invalid credentials", error));
                 return;
             }
         };

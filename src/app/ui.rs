@@ -1,4 +1,4 @@
-use super::{ACCENT_COLORS, App, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES};
+use super::{ACCENT_COLORS, App, CookieInputKind, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES};
 use crate::app::model::{Focus, NotificationMode, PlaybackStatus, Screen};
 use ratatui::{
     Frame,
@@ -64,7 +64,7 @@ impl App {
         let help_text = if self.search_editing {
             " type query  Enter: search  Esc: cancel "
         } else if self.cookie_input.is_some() {
-            " paste browser cookie  Enter: validate  Esc: cancel "
+            " type or paste input  Enter: validate  Esc: cancel "
         } else if self.focus == Focus::Nav {
             " j/k: navigate  l/Enter: content  /: search  P: player  q: quit "
         } else if self.is_home_list() {
@@ -72,7 +72,7 @@ impl App {
         } else if self.is_search_list() {
             " j/k: select  Enter: play  /: search  Space: pause  P: player  Esc: navigation "
         } else if self.is_settings() {
-            " j/k: setting  h/l: change  Enter: select  d: remove cookie  Esc: navigation "
+            " j/k: setting  h/l: change  Enter: import cookies.txt  c: paste cookie  d: remove  Esc: navigation "
         } else {
             " Space: pause  [/] seek  n/p: track  P: player  Esc: navigation "
         };
@@ -355,7 +355,7 @@ impl App {
             ));
         }
         account_lines.push(Line::styled(
-            "[Enter] paste browser cookie",
+            "[Enter] import cookies.txt    [c] paste cookie header",
             Style::default().fg(if account_focused {
                 accent
             } else {
@@ -876,7 +876,7 @@ impl App {
             return;
         }
         let width = area.width.saturating_sub(4).min(76);
-        let height = area.height.saturating_sub(2).min(13);
+        let height = area.height.saturating_sub(2).min(17);
         let popup = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -884,47 +884,77 @@ impl App {
             height,
         );
         let input_status = if input.is_empty() {
-            "Waiting for paste...".to_owned()
+            match self.cookie_input_kind {
+                CookieInputKind::NetscapeFile => "Waiting for file path...".to_owned(),
+                CookieInputKind::Header => "Waiting for paste...".to_owned(),
+            }
         } else {
-            format!("{} characters captured", input.len())
+            match self.cookie_input_kind {
+                CookieInputKind::NetscapeFile => input.clone(),
+                CookieInputKind::Header => format!("{} characters captured", input.len()),
+            }
         };
-        let lines = vec![
-            Line::styled(
-                "1. Sign in at music.youtube.com",
-                Style::default().fg(Color::Gray),
+        let (title, instructions, input_label) = match self.cookie_input_kind {
+            CookieInputKind::NetscapeFile => (
+                " Import cookies.txt ",
+                vec![
+                    "1. Open one private browser tab and sign into YouTube",
+                    "2. In that tab, visit youtube.com/robots.txt",
+                    "3. Export youtube.com cookies in Netscape format",
+                    "4. Close the private window, then enter the exported path",
+                ],
+                "Path: ",
             ),
-            Line::styled(
-                "2. Open Developer Tools > Network and reload",
-                Style::default().fg(Color::Gray),
+            CookieInputKind::Header => (
+                " Browser Cookie Sign-In ",
+                vec![
+                    "1. Sign in at music.youtube.com",
+                    "2. Open Developer Tools > Network and reload",
+                    "3. Open a youtubei/v1/browse request",
+                    "4. Copy the complete Cookie request-header value",
+                ],
+                "Input: ",
             ),
-            Line::styled(
-                "3. Open a youtubei/v1/browse request",
-                Style::default().fg(Color::Gray),
-            ),
-            Line::styled(
-                "4. Copy the complete Cookie request-header value",
-                Style::default().fg(Color::Gray),
-            ),
+        };
+        let mut lines = instructions
+            .into_iter()
+            .map(|line| Line::styled(line, Style::default().fg(Color::Gray)))
+            .collect::<Vec<_>>();
+        lines.extend([
             Line::default(),
             Line::from(vec![
-                Span::styled("Input: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(input_label, Style::default().fg(Color::DarkGray)),
                 Span::styled(input_status, Style::default().fg(self.accent_color())),
             ]),
-            Line::styled(
-                "The cookie is hidden and will be saved with owner-only permissions.",
+        ]);
+        match self.cookie_input_kind {
+            CookieInputKind::NetscapeFile => lines.extend([
+                Line::styled(
+                    "Only a filtered private credential is saved; the export is not copied.",
+                    Style::default().fg(Color::Yellow),
+                ),
+                Line::styled(
+                    "The source file stays unchanged. Delete it after a successful import.",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            CookieInputKind::Header => lines.push(Line::styled(
+                "The cookie is hidden and saved with owner-only permissions.",
                 Style::default().fg(Color::Yellow),
-            ),
+            )),
+        }
+        lines.extend([
             Line::default(),
             Line::styled(
                 "Enter: validate and save    Esc: cancel",
                 Style::default().fg(Color::DarkGray),
             ),
-        ];
+        ]);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: true }).block(
                 Block::default()
-                    .title(" Browser Cookie Sign-In ")
+                    .title(title)
                     .title_style(Style::default().add_modifier(Modifier::BOLD))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)

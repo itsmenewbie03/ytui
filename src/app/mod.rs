@@ -1,10 +1,12 @@
 mod model;
+mod mpris;
 mod ui;
 
 use self::model::{
     Focus, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack, Screen,
     SearchItem, home_shelves, search_items,
 };
+use self::mpris::{MprisCommand, MprisService, MprisSnapshot};
 use crate::config::{Config, Credentials};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
 use crate::scraper::ytmusic::{AccountIdentity, AudioStreamInfo, UpNextQueue, YTMusic};
@@ -78,6 +80,7 @@ enum CookieInputKind {
 
 pub fn run() -> Result<()> {
     let runtime = Runtime::new().wrap_err("failed to create async runtime")?;
+    let mpris = MprisService::start();
     let (config, config_warning) = match Config::load() {
         Ok(config) => (config, None),
         Err(error) => (Config::default(), Some(error)),
@@ -100,6 +103,7 @@ pub fn run() -> Result<()> {
         .join("; ");
     let mut app = App::new(
         runtime,
+        mpris,
         init_receiver,
         config,
         has_credentials,
@@ -129,6 +133,8 @@ struct App {
     focus: Focus,
     screen: Screen,
     player_tab: usize,
+    mpris: MprisService,
+    last_mpris_snapshot: Option<MprisSnapshot>,
     runtime: Runtime,
     config: Config,
     ytmusic: Option<YTMusic>,
@@ -147,6 +153,8 @@ struct App {
     play_receiver: Option<Receiver<PlayRequestResult>>,
     up_next_receiver: Option<Receiver<UpNextRequestResult>>,
     up_next_state: ListState,
+    pause_on_load: bool,
+    pending_pause: Option<bool>,
     player: Option<MpvPlayer>,
     playback: PlaybackState,
     notification: Option<Notification>,
@@ -166,6 +174,7 @@ struct App {
 impl App {
     fn new(
         runtime: Runtime,
+        mpris: MprisService,
         init_receiver: Receiver<InitRequestResult>,
         config: Config,
         has_credentials: bool,
@@ -188,6 +197,8 @@ impl App {
             focus: Focus::Nav,
             screen: Screen::Main,
             player_tab: 0,
+            mpris,
+            last_mpris_snapshot: None,
             runtime,
             config,
             ytmusic: None,
@@ -206,6 +217,8 @@ impl App {
             play_receiver: None,
             up_next_receiver: None,
             up_next_state: ListState::default(),
+            pause_on_load: false,
+            pending_pause: None,
             player: None,
             playback: PlaybackState::default(),
             notification: config_warning
@@ -233,6 +246,10 @@ impl App {
             self.poll_play_request();
             self.poll_up_next();
             self.poll_player_events();
+            if self.poll_mpris_commands() {
+                return Ok(());
+            }
+            self.publish_mpris();
             self.expire_notification();
             terminal.draw(|frame| self.render(frame))?;
 
@@ -250,10 +267,10 @@ impl App {
                 }
                 if self.quit_confirmation {
                     match key.code {
-                        KeyCode::Enter | KeyCode::Char('y') => return Ok(()),
-                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
-                            self.quit_confirmation = false;
+                        KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('y') => {
+                            return Ok(());
                         }
+                        KeyCode::Esc | KeyCode::Char('n') => self.quit_confirmation = false,
                         _ => {}
                     }
                 } else if self.cookie_input.is_some() {
@@ -302,8 +319,8 @@ impl App {
                         }
                         KeyCode::Enter if self.player_tab == 1 => self.play_selected_up_next(),
                         KeyCode::Char(' ') => self.toggle_pause(),
-                        KeyCode::Char('[') => self.seek(-10),
-                        KeyCode::Char(']') => self.seek(10),
+                        KeyCode::Char('[') => self.seek(-10.0),
+                        KeyCode::Char(']') => self.seek(10.0),
                         KeyCode::Char('n') => self.next_track(),
                         KeyCode::Char('p') => self.previous_track(),
                         _ => {}
@@ -313,9 +330,9 @@ impl App {
                 } else if key.code == KeyCode::Char(' ') {
                     self.toggle_pause();
                 } else if key.code == KeyCode::Char('[') {
-                    self.seek(-10);
+                    self.seek(-10.0);
                 } else if key.code == KeyCode::Char(']') {
-                    self.seek(10);
+                    self.seek(10.0);
                 } else if key.code == KeyCode::Char('n') {
                     self.next_track();
                 } else if key.code == KeyCode::Char('p') {
@@ -619,11 +636,24 @@ impl App {
                     track.likes = stream.likes;
                 }
                 match MpvPlayer::start(&stream.url) {
-                    Ok(player) => {
+                    Ok(mut player) => {
+                        if self.pause_on_load
+                            && let Err(error) = player.set_paused(true)
+                        {
+                            self.pause_on_load = false;
+                            self.playback_error(format!("Could not pause: {error}"));
+                            return;
+                        }
                         self.player = Some(player);
                         self.playback.position = 0.0;
                         self.playback.duration = 0.0;
-                        self.playback.status = PlaybackStatus::Loading;
+                        self.pending_pause = self.pause_on_load.then_some(true);
+                        self.playback.status = if self.pause_on_load {
+                            PlaybackStatus::Paused
+                        } else {
+                            PlaybackStatus::Loading
+                        };
+                        self.pause_on_load = false;
                     }
                     Err(error) => self.playback_error(format!("Could not start mpv: {error}")),
                 }
@@ -657,6 +687,8 @@ impl App {
                         video_id: track.video_id,
                         title: track.title,
                         artist: track.artist,
+                        album: track.album,
+                        art_url: track.art_url,
                         duration: track.duration,
                         views: None,
                         likes: None,
@@ -684,6 +716,21 @@ impl App {
                 self.playback.queue = tracks;
                 self.playback.queue_index =
                     (!self.playback.queue.is_empty()).then_some(current_index);
+                if let Some(index) = self.playback.queue_index
+                    && let Some(current) = self.playback.track.as_mut()
+                    && let Some(enriched) = self.playback.queue.get(index)
+                    && current.video_id == enriched.video_id
+                {
+                    if current.album.is_none() {
+                        current.album = enriched.album.clone();
+                    }
+                    if current.art_url.is_none() {
+                        current.art_url = enriched.art_url.clone();
+                    }
+                    if current.duration.is_none() {
+                        current.duration = enriched.duration.clone();
+                    }
+                }
                 self.up_next_state.select(self.playback.queue_index);
             }
             Ok(Err(error)) => {
@@ -709,31 +756,96 @@ impl App {
                 .and_then(|player| player.try_recv().ok());
             let Some(event) = event else { break };
             match event {
-                PlayerEvent::FileLoaded => self.mark_playing(),
+                PlayerEvent::FileLoaded
+                    if !matches!(self.playback.status, PlaybackStatus::Paused) =>
+                {
+                    self.mark_playing();
+                }
+                PlayerEvent::FileLoaded => {}
                 PlayerEvent::Position(position) => {
                     self.playback.position = position;
                     if matches!(self.playback.status, PlaybackStatus::Loading) {
                         self.mark_playing();
                     }
                 }
+                PlayerEvent::Seeked(position) => {
+                    self.playback.position = position;
+                    self.mpris.seeked(position);
+                }
                 PlayerEvent::Duration(duration) => self.playback.duration = duration,
-                PlayerEvent::Paused(paused)
-                    if !matches!(
+                PlayerEvent::Paused(paused) => {
+                    if self
+                        .pending_pause
+                        .is_some_and(|expected| paused != expected)
+                    {
+                        continue;
+                    }
+                    self.pending_pause = None;
+                    if matches!(
                         self.playback.status,
                         PlaybackStatus::Resolving | PlaybackStatus::Loading
-                    ) =>
-                {
+                    ) {
+                        continue;
+                    }
                     self.playback.status = if paused {
                         PlaybackStatus::Paused
                     } else {
                         PlaybackStatus::Playing
                     };
                 }
-                PlayerEvent::Paused(_) => {}
-                PlayerEvent::EndOfFile => self.next_track(),
+                PlayerEvent::EndOfFile => self.advance_after_end_of_file(),
                 PlayerEvent::Diagnostic(message) => self.append_playback_diagnostic(message),
                 PlayerEvent::Error(error) => self.playback_error(format!("mpv error: {error}")),
             }
+        }
+    }
+
+    fn poll_mpris_commands(&mut self) -> bool {
+        loop {
+            let command = match self.mpris.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
+            };
+            match command {
+                MprisCommand::Next => self.next_track(),
+                MprisCommand::Previous => self.previous_track(),
+                MprisCommand::Pause => self.pause(),
+                MprisCommand::PlayPause => self.play_pause(),
+                MprisCommand::Stop => self.stop_playback(),
+                MprisCommand::Play => self.play(),
+                MprisCommand::Seek(offset) => {
+                    if self.player.is_some() && self.playback.duration > 0.0 {
+                        let offset = offset as f64 / 1_000_000.0;
+                        if self.playback.position + offset > self.playback.duration {
+                            self.next_track();
+                        } else {
+                            self.seek(offset);
+                        }
+                    }
+                }
+                MprisCommand::SetPosition { track_id, position } => {
+                    let snapshot =
+                        MprisSnapshot::from_playback(&self.playback, self.player.is_some());
+                    let position = position as f64 / 1_000_000.0;
+                    if snapshot.track_id() == Some(track_id.as_str())
+                        && self.player.is_some()
+                        && self.playback.duration > 0.0
+                        && position >= 0.0
+                        && position < self.playback.duration
+                    {
+                        self.seek_absolute(position);
+                    }
+                }
+                MprisCommand::Quit => return true,
+            }
+        }
+    }
+
+    fn publish_mpris(&mut self) {
+        let snapshot = MprisSnapshot::from_playback(&self.playback, self.player.is_some());
+        if self.last_mpris_snapshot.as_ref() != Some(&snapshot) {
+            self.mpris.publish(snapshot.clone());
+            self.last_mpris_snapshot = Some(snapshot);
         }
     }
 
@@ -915,7 +1027,7 @@ impl App {
         };
         let entry = &self.home_shelves[self.home_shelf].items[index];
         if let Some(track) = entry.playback_track() {
-            self.request_play(track, true);
+            self.request_play(track, true, false);
         } else {
             self.notification = Some(Notification::info("Browse", entry.browse_message()));
         }
@@ -934,11 +1046,13 @@ impl App {
                 video_id: video_id.clone(),
                 title: self.search_items[index].title.clone(),
                 artist: self.search_items[index].detail.clone(),
+                album: self.search_items[index].album.clone(),
+                art_url: self.search_items[index].art_url.clone(),
                 duration: None,
                 views: None,
                 likes: None,
             };
-            self.request_play(track, true);
+            self.request_play(track, true, false);
         } else {
             self.notification = Some(Notification::warning(
                 "Not playable",
@@ -947,7 +1061,7 @@ impl App {
         }
     }
 
-    fn request_play(&mut self, track: PlaybackTrack, load_queue: bool) {
+    fn request_play(&mut self, track: PlaybackTrack, load_queue: bool, start_paused: bool) {
         let Some(ytmusic) = self.ytmusic.clone() else {
             self.notification = Some(Notification::warning(
                 "Not ready",
@@ -955,6 +1069,9 @@ impl App {
             ));
             return;
         };
+        self.player = None;
+        self.pause_on_load = start_paused;
+        self.pending_pause = None;
         let video_id = track.video_id.clone();
         let title = track.title.clone();
         let (sender, receiver) = mpsc::channel();
@@ -982,7 +1099,11 @@ impl App {
         self.playback.track = Some(track);
         self.playback.position = 0.0;
         self.playback.duration = 0.0;
-        self.playback.status = PlaybackStatus::Resolving;
+        self.playback.status = if start_paused {
+            PlaybackStatus::Paused
+        } else {
+            PlaybackStatus::Resolving
+        };
         self.playback.error = None;
         self.playback.diagnostics.clear();
         self.playback.stream_url = None;
@@ -991,19 +1112,77 @@ impl App {
     }
 
     fn toggle_pause(&mut self) {
+        self.play_pause();
+    }
+
+    fn pause(&mut self) {
+        if matches!(self.playback.status, PlaybackStatus::Paused) {
+            return;
+        }
         let Some(player) = self.player.as_mut() else {
             return;
         };
-        if let Err(error) = player.toggle_pause() {
-            self.playback_error(format!("Could not toggle pause: {error}"));
+        if let Err(error) = player.set_paused(true) {
+            self.playback_error(format!("Could not pause: {error}"));
+        } else {
+            self.pending_pause = Some(true);
+            self.playback.status = PlaybackStatus::Paused;
         }
     }
 
-    fn seek(&mut self, seconds: i64) {
+    fn play(&mut self) {
+        if matches!(self.playback.status, PlaybackStatus::Paused) {
+            let Some(player) = self.player.as_mut() else {
+                return;
+            };
+            if let Err(error) = player.set_paused(false) {
+                self.playback_error(format!("Could not resume: {error}"));
+            } else {
+                self.pending_pause = Some(false);
+                self.playback.status = PlaybackStatus::Playing;
+            }
+        } else if matches!(
+            self.playback.status,
+            PlaybackStatus::Stopped | PlaybackStatus::Error
+        ) && let Some(track) = self.playback.track.clone()
+        {
+            self.request_play(track, false, false);
+        }
+    }
+
+    fn play_pause(&mut self) {
+        if matches!(self.playback.status, PlaybackStatus::Paused) {
+            self.play();
+        } else if self.player.is_some() {
+            self.pause();
+        } else {
+            self.play();
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        self.play_receiver = None;
+        self.pause_on_load = false;
+        self.pending_pause = None;
+        self.player = None;
+        self.playback.status = PlaybackStatus::Stopped;
+        self.playback.position = 0.0;
+    }
+
+    fn seek(&mut self, seconds: f64) {
         let Some(player) = self.player.as_mut() else {
             return;
         };
         if let Err(error) = player.seek(seconds) {
+            self.playback_error(format!("Could not seek: {error}"));
+        }
+    }
+
+    fn seek_absolute(&mut self, seconds: f64) {
+        let Some(player) = self.player.as_mut() else {
+            return;
+        };
+        if let Err(error) = player.seek_absolute(seconds) {
             self.playback_error(format!("Could not seek: {error}"));
         }
     }
@@ -1014,8 +1193,19 @@ impl App {
         };
         let next = current + 1;
         if next < self.playback.queue.len() {
-            self.play_queue_index(next);
+            self.move_queue_index(next);
+        }
+    }
+
+    fn advance_after_end_of_file(&mut self) {
+        let has_next = self
+            .playback
+            .queue_index
+            .is_some_and(|index| index + 1 < self.playback.queue.len());
+        if has_next {
+            self.next_track();
         } else {
+            self.player = None;
             self.playback.status = PlaybackStatus::Stopped;
             self.notification = Some(Notification::info("Queue finished", "No next track."));
         }
@@ -1026,7 +1216,27 @@ impl App {
             return;
         };
         if current > 0 {
-            self.play_queue_index(current - 1);
+            self.move_queue_index(current - 1);
+        }
+    }
+
+    fn move_queue_index(&mut self, index: usize) {
+        let Some(track) = self.playback.queue.get(index).cloned() else {
+            return;
+        };
+        self.playback.queue_index = Some(index);
+        self.up_next_state.select(Some(index));
+        if matches!(self.playback.status, PlaybackStatus::Stopped) {
+            self.play_receiver = None;
+            self.player = None;
+            self.playback.track = Some(track);
+            self.playback.position = 0.0;
+            self.playback.duration = 0.0;
+            self.playback.error = None;
+            self.playback.stream_url = None;
+        } else {
+            let start_paused = matches!(self.playback.status, PlaybackStatus::Paused);
+            self.request_play(track, false, start_paused);
         }
     }
 
@@ -1036,7 +1246,7 @@ impl App {
         };
         self.playback.queue_index = Some(index);
         self.up_next_state.select(Some(index));
-        self.request_play(track, false);
+        self.request_play(track, false, false);
     }
 
     fn previous_up_next(&mut self) {

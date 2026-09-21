@@ -20,12 +20,20 @@ pub struct UpNextTrack {
     pub video_id: String,
     pub title: String,
     pub artist: String,
+    pub album: Option<String>,
     pub duration: Option<String>,
+    pub art_url: Option<String>,
 }
 
 pub struct UpNextQueue {
     pub tracks: Vec<UpNextTrack>,
     pub current_index: usize,
+}
+
+struct PanelExtras {
+    artist: Option<String>,
+    album: Option<String>,
+    art_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -98,12 +106,14 @@ impl YTMusic {
             )
             .await?;
         let value: Value = response.json().await?;
-        let panel = find_playlist_panel(&value)
-            .and_then(innertube_rs::PlaylistPanelNode::from_value)
-            .ok_or_else(|| {
-                innertube_rs::InnertubeError::Other("Could not fetch Automix queue".to_owned())
-            })?;
-        Ok(up_next_queue(panel, video_id))
+        let panel_value = find_playlist_panel(&value).ok_or_else(|| {
+            innertube_rs::InnertubeError::Other("Could not fetch Automix queue".to_owned())
+        })?;
+        let panel = innertube_rs::PlaylistPanelNode::from_value(panel_value).ok_or_else(|| {
+            innertube_rs::InnertubeError::Other("Could not fetch Automix queue".to_owned())
+        })?;
+        let extras = parse_panel_extras(panel_value);
+        Ok(up_next_queue(panel, video_id, extras))
     }
 
     pub async fn get_audio_url(&self, video_id: &str) -> innertube_rs::error::Result<String> {
@@ -171,7 +181,11 @@ impl YTMusic {
     }
 }
 
-fn up_next_queue(panel: innertube_rs::PlaylistPanelNode, current_video_id: &str) -> UpNextQueue {
+fn up_next_queue(
+    panel: innertube_rs::PlaylistPanelNode,
+    current_video_id: &str,
+    extras: Vec<PanelExtras>,
+) -> UpNextQueue {
     let current_index = panel
         .items
         .iter()
@@ -186,17 +200,72 @@ fn up_next_queue(panel: innertube_rs::PlaylistPanelNode, current_video_id: &str)
     let tracks = panel
         .items
         .into_iter()
-        .map(|item| UpNextTrack {
+        .zip(extras)
+        .map(|(item, extra)| UpNextTrack {
             video_id: item.id,
             title: item.title,
-            artist: item.author.unwrap_or_default(),
+            artist: extra.artist.unwrap_or(item.author.unwrap_or_default()),
+            album: extra.album,
             duration: item.duration,
+            art_url: extra.art_url,
         })
         .collect();
     UpNextQueue {
         tracks,
         current_index,
     }
+}
+
+fn parse_panel_extras(panel: &Value) -> Vec<PanelExtras> {
+    let Some(contents) = panel.get("contents").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    contents
+        .iter()
+        .map(|item| {
+            let renderer = item.get("playlistPanelVideoRenderer");
+            let artist = renderer
+                .and_then(|renderer| renderer.pointer("/longBylineText/runs/0/text"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let album = renderer
+                .and_then(|renderer| renderer.pointer("/longBylineText/runs"))
+                .and_then(Value::as_array)
+                .and_then(|runs| {
+                    runs.iter().find(|run| {
+                        run.pointer(
+                            "/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType",
+                        )
+                        .and_then(Value::as_str)
+                        == Some("MUSIC_PAGE_TYPE_ALBUM")
+                    })
+                })
+                .and_then(|run| run.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let art_url = renderer
+                .and_then(|renderer| {
+                    renderer
+                        .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+                        .or_else(|| {
+                            renderer.pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
+                        })
+                        .or_else(|| renderer.get("thumbnail").and_then(|t| t.get("thumbnails")))
+                })
+                .and_then(Value::as_array)
+                .and_then(|list| {
+                    list.iter()
+                        .max_by_key(|thumbnail| thumbnail["width"].as_u64().unwrap_or(0))
+                })
+                .and_then(|thumbnail| thumbnail["url"].as_str())
+                .map(str::to_owned);
+            PanelExtras {
+                artist,
+                album,
+                art_url,
+            }
+        })
+        .collect()
 }
 
 fn find_playlist_panel(value: &Value) -> Option<&Value> {
@@ -372,11 +441,83 @@ mod tests {
             ],
         };
 
-        let queue = up_next_queue(panel, "current");
+        let extras = vec![
+            PanelExtras {
+                artist: Some("Artist One".to_owned()),
+                album: Some("Album One".to_owned()),
+                art_url: Some("https://example.com/one.jpg".to_owned()),
+            },
+            PanelExtras {
+                artist: Some("Artist Two".to_owned()),
+                album: None,
+                art_url: None,
+            },
+        ];
+
+        let queue = up_next_queue(panel, "current", extras);
         assert_eq!(queue.current_index, 1);
         assert_eq!(queue.tracks.len(), 2);
         assert_eq!(queue.tracks[1].title, "Current");
         assert_eq!(queue.tracks[1].duration.as_deref(), Some("4:20"));
+        assert_eq!(queue.tracks[0].artist, "Artist One");
+        assert_eq!(queue.tracks[0].album.as_deref(), Some("Album One"));
+        assert_eq!(
+            queue.tracks[0].art_url.as_deref(),
+            Some("https://example.com/one.jpg")
+        );
+    }
+
+    #[test]
+    fn extracts_square_art_and_album_from_panel_item() {
+        let panel = json!({
+            "contents": [
+                {
+                    "playlistPanelVideoRenderer": {
+                        "videoId": "abc",
+                        "longBylineText": {
+                            "runs": [
+                                { "text": "Neon Sage" },
+                                { "text": " • " },
+                                {
+                                    "text": "Dyosa",
+                                    "navigationEndpoint": {
+                                        "browseEndpoint": {
+                                            "browseId": "MPREb_aUeEJBruyDC",
+                                            "browseEndpointContextSupportedConfigs": {
+                                                "browseEndpointContextMusicConfig": {
+                                                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                { "text": " • " },
+                                { "text": "2024" }
+                            ]
+                        },
+                        "thumbnail": {
+                            "musicThumbnailRenderer": {
+                                "thumbnail": {
+                                    "thumbnails": [
+                                        { "url": "https://example.com/small.jpg", "width": 120, "height": 120 },
+                                        { "url": "https://example.com/large.jpg", "width": 544, "height": 544 }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let extras = parse_panel_extras(&panel);
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].artist.as_deref(), Some("Neon Sage"));
+        assert_eq!(extras[0].album.as_deref(), Some("Dyosa"));
+        assert_eq!(
+            extras[0].art_url.as_deref(),
+            Some("https://example.com/large.jpg")
+        );
     }
 
     #[tokio::test]
@@ -392,5 +533,51 @@ mod tests {
 
         assert!(queue.tracks.len() > 1);
         assert_eq!(queue.tracks[queue.current_index].video_id, "dQw4w9WgXcQ");
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music compatibility probe"]
+    async fn extracts_square_art_and_album_from_live_automix() {
+        let client = YTMusic::new(None)
+            .await
+            .expect("anonymous client should initialize");
+        let queue = client
+            .get_up_next("LG5E5zeeWng")
+            .await
+            .expect("anonymous Automix should load");
+
+        let current = &queue.tracks[queue.current_index];
+        assert_eq!(current.video_id, "LG5E5zeeWng");
+        assert_eq!(current.artist, "Neon Sage");
+        assert_eq!(current.album.as_deref(), Some("Dyosa"));
+        let art_url = current
+            .art_url
+            .as_deref()
+            .expect("music art should be present");
+        assert!(
+            art_url.contains("yt3.googleusercontent.com"),
+            "expected square yt3 art, got {art_url}"
+        );
+        assert!(
+            art_url.contains("=w"),
+            "expected sized square art, got {art_url}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music compatibility probe"]
+    async fn extracts_album_after_artist_navigation_run() {
+        let client = YTMusic::new(None)
+            .await
+            .expect("anonymous client should initialize");
+        let queue = client
+            .get_up_next("dHdMAdh4Xgc")
+            .await
+            .expect("anonymous Automix should load");
+
+        let current = &queue.tracks[queue.current_index];
+        assert_eq!(current.video_id, "dHdMAdh4Xgc");
+        assert_eq!(current.artist, "Clean Bandit");
+        assert_eq!(current.album.as_deref(), Some("New Eyes"));
     }
 }

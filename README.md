@@ -15,6 +15,7 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 - Build interactive Up Next queues from YouTube Music Automix
 - Play the highest-quality available audio stream through `mpv`
 - Pause, seek, and move through the current queue
+- Control playback from desktop media keys and MPRIS clients
 - See playback progress, duration, views, and likes at a glance
 - Navigate with Vim-style keys or arrow keys
 - Copy playback diagnostics with an available system clipboard tool
@@ -32,6 +33,8 @@ You must have the following available on your system:
 - An internet connection
 
 Clipboard support is optional. Install `wl-copy`, `xclip`, or `xsel` if you want to copy playback diagnostics from the app.
+
+On Linux desktops, ytui automatically publishes playback metadata and controls over MPRIS when a D-Bus session is available. This supports media keys, lock-screen controls, `playerctl`, Waybar, KDE, and GNOME without an mpv plugin, including the current track's artwork.
 
 ## 🛠️ Setup
 
@@ -127,9 +130,15 @@ The live stream compatibility test is ignored by default because it needs networ
 cargo test --test client_streams -- --ignored --nocapture
 ```
 
+The MPRIS smoke test needs `dbus-run-session` and `playerctl`:
+
+```shell
+dbus-run-session -- cargo test registers_with_a_session_bus -- --ignored --nocapture
+```
+
 ## 🔌 How It Works
 
-ytui uses [`innertube-rs`](https://crates.io/crates/innertube-rs) to load YouTube Music data and resolve audio streams. Playback runs in a managed `mpv` process controlled through its JSON IPC socket, while [Ratatui](https://ratatui.rs/) and Crossterm power the terminal interface.
+ytui uses [`innertube-rs`](https://crates.io/crates/innertube-rs) to load YouTube Music data and resolve audio streams. Playback runs in a managed `mpv` process controlled through its JSON IPC socket, while [Ratatui](https://ratatui.rs/) and Crossterm power the terminal interface. A native MPRIS service bridges desktop media controls into the same playback state and command loop.
 
 ## 🤝 Contributing
 

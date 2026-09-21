@@ -19,6 +19,8 @@ pub(super) enum HomeEntry {
         video_id: String,
         title: String,
         artist: String,
+        album: Option<String>,
+        art_url: Option<String>,
     },
     Album {
         browse_id: String,
@@ -61,6 +63,8 @@ impl HomeEntry {
             video_id,
             title,
             artist,
+            album,
+            art_url,
         } = self
         else {
             return None;
@@ -69,6 +73,8 @@ impl HomeEntry {
             video_id: video_id.clone(),
             title: title.clone(),
             artist: artist.clone(),
+            album: album.clone(),
+            art_url: art_url.clone(),
             duration: None,
             views: None,
             likes: None,
@@ -98,6 +104,8 @@ pub(super) struct SearchItem {
     pub(super) title: String,
     pub(super) detail: String,
     pub(super) video_id: Option<String>,
+    pub(super) album: Option<String>,
+    pub(super) art_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -105,6 +113,8 @@ pub(super) struct PlaybackTrack {
     pub(super) video_id: String,
     pub(super) title: String,
     pub(super) artist: String,
+    pub(super) album: Option<String>,
+    pub(super) art_url: Option<String>,
     pub(super) duration: Option<String>,
     pub(super) views: Option<u64>,
     pub(super) likes: Option<u64>,
@@ -221,6 +231,8 @@ pub(super) fn home_shelves(feed: MusicHomeFeed) -> Vec<HomeShelf> {
                         } else {
                             artist
                         },
+                        album: track.album.map(|album| album.title),
+                        art_url: track.thumbnail,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -277,6 +289,8 @@ pub(super) fn search_items(results: MusicSearchResults) -> Vec<SearchItem> {
                     artists
                 },
                 video_id: Some(track.video_id),
+                album: track.album.map(|album| album.title),
+                art_url: track.thumbnail,
             }
         })
         .collect::<Vec<_>>();
@@ -285,12 +299,16 @@ pub(super) fn search_items(results: MusicSearchResults) -> Vec<SearchItem> {
         title: album.title,
         detail: album.artist.unwrap_or_else(|| "Unknown artist".to_owned()),
         video_id: None,
+        album: None,
+        art_url: None,
     }));
     items.extend(results.artists.into_iter().map(|artist| SearchItem {
         kind: "Artist",
         title: artist.name,
         detail: artist.subscribers.unwrap_or_default(),
         video_id: None,
+        album: None,
+        art_url: None,
     }));
     items.extend(results.playlists.into_iter().map(|playlist| {
         SearchItem {
@@ -300,6 +318,8 @@ pub(super) fn search_items(results: MusicSearchResults) -> Vec<SearchItem> {
                 .author
                 .unwrap_or_else(|| "YouTube Music".to_owned()),
             video_id: None,
+            album: None,
+            art_url: None,
         }
     }));
     items

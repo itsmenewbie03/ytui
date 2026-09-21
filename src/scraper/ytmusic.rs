@@ -5,10 +5,22 @@ use innertube_rs::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+const MUSIC_ORIGIN: &str = "https://music.youtube.com";
+const MUSIC_CLIENT_ID: &str = "67";
+const MUSIC_CLIENT_VERSION_FALLBACK: &str = "1.20250219.01.00";
+
 pub struct AudioStreamInfo {
     pub url: String,
     pub views: Option<u64>,
     pub likes: Option<u64>,
+    pub tracking: Option<WatchTracking>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchTracking {
+    pub cpn: String,
+    pub playback_url: Option<String>,
+    pub watchtime_url: Option<String>,
 }
 
 pub struct AccountIdentity {
@@ -40,6 +52,7 @@ struct PanelExtras {
 pub struct YTMusic {
     yt: Innertube,
     playback: Innertube,
+    music_client_version: String,
 }
 
 impl YTMusic {
@@ -58,7 +71,14 @@ impl YTMusic {
         } else {
             yt.clone()
         };
-        Ok(Self { yt, playback })
+        let music_client_version = fetch_music_client_version(&yt.session.http_client)
+            .await
+            .unwrap_or_else(|_| MUSIC_CLIENT_VERSION_FALLBACK.to_owned());
+        Ok(Self {
+            yt,
+            playback,
+            music_client_version,
+        })
     }
 
     pub async fn account_identity(&self) -> innertube_rs::error::Result<AccountIdentity> {
@@ -140,12 +160,22 @@ impl YTMusic {
     pub async fn get_audio_stream(
         &self,
         video_id: &str,
+        sync_history: bool,
     ) -> innertube_rs::error::Result<AudioStreamInfo> {
         let options = GetVideoInfoOptions {
-            client: Some("VISIONOS".to_owned()),
+            client: Some(if sync_history {
+                "YTMUSIC".to_owned()
+            } else {
+                "VISIONOS".to_owned()
+            }),
             ..Default::default()
         };
-        let info_request = self.playback.get_basic_info(video_id, Some(&options));
+        let playback = if sync_history {
+            &self.yt
+        } else {
+            &self.playback
+        };
+        let info_request = playback.get_basic_info(video_id, Some(&options));
         let likes_request = self.get_like_count(video_id);
         let (info, likes) = tokio::join!(info_request, likes_request);
         let info = info?;
@@ -161,13 +191,91 @@ impl YTMusic {
                 quality: QualityPreference::Highest,
                 container: None,
             },
-            &self.playback.player.decipherer,
+            &playback.player.decipherer,
         )?;
+        let tracking = if sync_history {
+            extract_tracking(&info)
+        } else {
+            None
+        };
         Ok(AudioStreamInfo {
             url,
             views,
             likes: likes.unwrap_or_default(),
+            tracking,
         })
+    }
+
+    pub async fn report_playback_start(
+        &self,
+        tracking: &WatchTracking,
+    ) -> innertube_rs::error::Result<()> {
+        let Some(url) = tracking.playback_url.as_deref() else {
+            return Ok(());
+        };
+        self.ping_stats(
+            url,
+            &[
+                ("cpn", tracking.cpn.clone()),
+                ("fmt", "251".to_owned()),
+                ("rtn", "0".to_owned()),
+                ("rt", "0".to_owned()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn report_watch_time(
+        &self,
+        tracking: &WatchTracking,
+        position: f64,
+        final_ping: bool,
+    ) -> innertube_rs::error::Result<()> {
+        let Some(url) = tracking.watchtime_url.as_deref() else {
+            return Ok(());
+        };
+        let ts = format!("{position:.3}");
+        self.ping_stats(
+            url,
+            &[
+                ("cpn", tracking.cpn.clone()),
+                ("cmt", ts.clone()),
+                ("st", ts.clone()),
+                ("et", ts),
+                ("final", if final_ping { "1" } else { "0" }.to_owned()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Ping the YouTube Music videostats endpoint with account authentication.
+    async fn ping_stats(
+        &self,
+        base_url: &str,
+        params: &[(&str, String)],
+    ) -> innertube_rs::error::Result<reqwest::Response> {
+        let url = build_music_stats_url(base_url, &self.music_client_version, params)?;
+        let mut headers = self.yt.session.build_innertube_headers();
+        self.yt
+            .session
+            .apply_auth_headers(&mut headers, false)
+            .await?;
+        let resp = self
+            .yt
+            .session
+            .http_client
+            .get(url)
+            .headers(headers)
+            .header("Origin", MUSIC_ORIGIN)
+            .header("Referer", format!("{MUSIC_ORIGIN}/"))
+            .header("X-Youtube-Client-Name", MUSIC_CLIENT_ID)
+            .header("X-Youtube-Client-Version", &self.music_client_version)
+            .send()
+            .await
+            .map_err(innertube_rs::InnertubeError::Network)?;
+        Ok(resp)
     }
 
     async fn get_like_count(&self, video_id: &str) -> innertube_rs::error::Result<Option<u64>> {
@@ -179,6 +287,113 @@ impl YTMusic {
         let value: Value = response.json().await?;
         Ok(find_like_count(&value))
     }
+}
+
+async fn fetch_music_client_version(
+    client: &reqwest::Client,
+) -> innertube_rs::error::Result<String> {
+    let response = client
+        .get(format!("{MUSIC_ORIGIN}/sw.js_data"))
+        .send()
+        .await
+        .map_err(innertube_rs::InnertubeError::Network)?;
+    if !response.status().is_success() {
+        return Err(innertube_rs::InnertubeError::Api {
+            status: response.status().to_string(),
+            message: "Failed to retrieve YouTube Music client version".to_owned(),
+        });
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(innertube_rs::InnertubeError::Network)?;
+    parse_music_client_version(&body).ok_or_else(|| {
+        innertube_rs::InnertubeError::Other(
+            "YouTube Music service worker data has no client version".to_owned(),
+        )
+    })
+}
+
+fn parse_music_client_version(data: &str) -> Option<String> {
+    data.as_bytes().windows(16).find_map(|candidate| {
+        let valid = candidate[0] == b'1'
+            && candidate[1] == b'.'
+            && candidate[10] == b'.'
+            && candidate[13] == b'.'
+            && candidate
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 1 | 10 | 13) || byte.is_ascii_digit());
+        valid.then(|| String::from_utf8_lossy(candidate).into_owned())
+    })
+}
+
+fn build_music_stats_url(
+    base_url: &str,
+    client_version: &str,
+    params: &[(&str, String)],
+) -> innertube_rs::error::Result<String> {
+    let music_url = if let Some(rest) = base_url.strip_prefix("https://s.youtube.com/") {
+        format!("https://music.youtube.com/{rest}")
+    } else if base_url.starts_with("https://music.youtube.com/") {
+        base_url.to_owned()
+    } else {
+        return Err(innertube_rs::InnertubeError::Format(
+            "Invalid YouTube Music stats host".to_owned(),
+        ));
+    };
+    let Some((base, query)) = music_url.split_once('?') else {
+        return Err(innertube_rs::InnertubeError::Format(
+            "Invalid stats URL: missing query string".to_owned(),
+        ));
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for part in query.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            pairs.push((part.to_owned(), String::new()));
+            continue;
+        };
+        pairs.push((key.to_owned(), value.to_owned()));
+    }
+    set_query_param(&mut pairs, "ver", "2".to_owned());
+    set_query_param(&mut pairs, "c", "web_remix".to_owned());
+    set_query_param(&mut pairs, "cbrver", client_version.to_owned());
+    set_query_param(&mut pairs, "cver", client_version.to_owned());
+    for (key, value) in params {
+        set_query_param(&mut pairs, key, value.clone());
+    }
+    let query = pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    Ok(format!("{base}?{query}"))
+}
+
+fn set_query_param(pairs: &mut Vec<(String, String)>, name: &str, value: String) {
+    for (k, v) in &mut *pairs {
+        if *k == name {
+            *k = name.to_owned();
+            *v = value;
+            return;
+        }
+    }
+    pairs.push((name.to_owned(), value));
+}
+
+fn extract_tracking(info: &innertube_rs::VideoInfo) -> Option<WatchTracking> {
+    let tracking = info.player_response.playback_tracking.as_ref()?;
+    Some(WatchTracking {
+        cpn: info.cpn.clone(),
+        playback_url: tracking
+            .videostats_playback_url
+            .as_ref()
+            .and_then(|url| url.base_url.clone()),
+        watchtime_url: tracking
+            .videostats_watchtime_url
+            .as_ref()
+            .and_then(|url| url.base_url.clone()),
+    })
 }
 
 fn up_next_queue(
@@ -465,6 +680,125 @@ mod tests {
             queue.tracks[0].art_url.as_deref(),
             Some("https://example.com/one.jpg")
         );
+    }
+
+    #[test]
+    fn builds_music_stats_url_with_live_client_identity() {
+        let base = "https://s.youtube.com/api/stats/watchtime?cl=982807685&docid=dQw4w9WgXcQ&vm=signed&el=shorts";
+        let url = build_music_stats_url(
+            base,
+            "1.20260915.14.00",
+            &[
+                ("cpn", "cpn-1234".to_owned()),
+                ("vm", "replaced".to_owned()),
+            ],
+        )
+        .expect("stats URL should be valid");
+
+        assert!(url.starts_with("https://music.youtube.com/api/stats/watchtime?"));
+        assert!(
+            url.contains("&docid=dQw4w9WgXcQ"),
+            "signed base params must survive"
+        );
+        assert!(
+            url.contains("&vm=replaced"),
+            "existing param should be overwritten in place"
+        );
+        assert!(
+            url.contains("&el=shorts"),
+            "base params should be preserved"
+        );
+        assert!(url.contains("&ver=2"), "ver should be added");
+        assert!(url.contains("&c=web_remix"), "Music client should be set");
+        assert!(
+            url.contains("&cbrver=1.20260915.14.00"),
+            "browser version should use the live Music version"
+        );
+        assert!(
+            url.contains("&cver=1.20260915.14.00"),
+            "client version should use the live Music version"
+        );
+        assert!(url.contains("&cpn=cpn-1234"), "cpn should be added");
+        assert_eq!(
+            url.chars().filter(|c| *c == '?').count(),
+            1,
+            "exactly one query separator"
+        );
+    }
+
+    #[test]
+    fn extracts_music_client_version_from_service_worker_data() {
+        let data = r#")]}'\n[[[\"foo\",\"1.20260915.14.00\",\"bar\"]]]"#;
+
+        assert_eq!(
+            parse_music_client_version(data).as_deref(),
+            Some("1.20260915.14.00")
+        );
+        assert_eq!(parse_music_client_version("no version here"), None);
+    }
+
+    #[test]
+    fn extracts_watch_tracking_from_player_response() {
+        let info = innertube_rs::VideoInfo {
+            player_response: innertube_rs::PlayerResponse {
+                playability_status: innertube_rs::PlayabilityStatus {
+                    status: "OK".to_owned(),
+                    reason: None,
+                    playable_in_embed: Some(true),
+                },
+                video_details: None,
+                streaming_data: None,
+                captions: None,
+                playback_tracking: Some(innertube_rs::models::video::PlaybackTracking {
+                    videostats_watchtime_url: Some(innertube_rs::models::video::TrackingUrl {
+                        base_url: Some(
+                            "https://s.youtube.com/api/stats/watchtime?key=abc".to_owned(),
+                        ),
+                    }),
+                    videostats_playback_url: Some(innertube_rs::models::video::TrackingUrl {
+                        base_url: Some(
+                            "https://s.youtube.com/api/stats/playback?key=abc".to_owned(),
+                        ),
+                    }),
+                }),
+            },
+            watch_next: None,
+            cpn: "cpn-1234".to_owned(),
+            po_token: None,
+        };
+
+        let tracking = extract_tracking(&info).expect("tracking should be extracted");
+        assert_eq!(tracking.cpn, "cpn-1234");
+        assert_eq!(
+            tracking.playback_url.as_deref(),
+            Some("https://s.youtube.com/api/stats/playback?key=abc")
+        );
+        assert_eq!(
+            tracking.watchtime_url.as_deref(),
+            Some("https://s.youtube.com/api/stats/watchtime?key=abc")
+        );
+    }
+
+    #[test]
+    fn returns_none_when_player_response_lacks_tracking() {
+        let info = innertube_rs::VideoInfo {
+            player_response: innertube_rs::PlayerResponse {
+                playability_status: innertube_rs::PlayabilityStatus {
+                    status: "OK".to_owned(),
+                    reason: None,
+                    playable_in_embed: Some(true),
+                },
+                video_details: None,
+                streaming_data: None,
+                captions: None,
+                playback_tracking: None,
+            },
+            watch_next: None,
+            cpn: "cpn-1234".to_owned(),
+            po_token: None,
+        };
+
+        assert_eq!(extract_tracking(&info), None);
     }
 
     #[test]

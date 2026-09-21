@@ -306,23 +306,6 @@ impl App {
         );
 
         let account_y = account_header_y.saturating_add(2);
-        let account_area = Rect::new(
-            inner.x,
-            account_y,
-            setting_width,
-            inner.bottom().saturating_sub(account_y),
-        );
-        let account_block = Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(if account_focused {
-                accent
-            } else {
-                Color::DarkGray
-            }))
-            .padding(Padding::horizontal(2));
-        let account_inner = account_block.inner(account_area);
-        frame.render_widget(account_block, account_area);
-
         let title_style = Style::default()
             .fg(if account_focused {
                 Color::White
@@ -369,9 +352,110 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        let account_height = u16::try_from(account_lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(inner.bottom().saturating_sub(account_y));
+        let account_area = Rect::new(inner.x, account_y, setting_width, account_height);
+        let account_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(if account_focused {
+                accent
+            } else {
+                Color::DarkGray
+            }))
+            .padding(Padding::horizontal(2));
+        let account_inner = account_block.inner(account_area);
+        frame.render_widget(account_block, account_area);
         frame.render_widget(
             Paragraph::new(account_lines).wrap(Wrap { trim: true }),
             account_inner,
+        );
+
+        let playback_header_y = account_area.bottom().saturating_add(1);
+        if playback_header_y >= inner.bottom() {
+            return;
+        }
+        let playback_focused = is_focused && self.settings_row == 2;
+        let playback_header = "PLAYBACK ";
+        let playback_rule =
+            "─".repeat(usize::from(inner.width).saturating_sub(playback_header.chars().count()));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    playback_header,
+                    Style::default()
+                        .fg(if playback_focused {
+                            accent
+                        } else {
+                            Color::DarkGray
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(playback_rule, Style::default().fg(Color::DarkGray)),
+            ])),
+            Rect::new(inner.x, playback_header_y, inner.width, 1),
+        );
+
+        let playback_y = playback_header_y.saturating_add(2);
+        let playback_area = Rect::new(
+            inner.x,
+            playback_y,
+            setting_width,
+            inner.bottom().saturating_sub(playback_y),
+        );
+        let playback_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(if playback_focused {
+                accent
+            } else {
+                Color::DarkGray
+            }))
+            .padding(Padding::horizontal(2));
+        let playback_inner = playback_block.inner(playback_area);
+        frame.render_widget(playback_block, playback_area);
+
+        let mut playback_lines = vec![Line::from(vec![
+            Span::styled(
+                if self.config.watch_history {
+                    "● "
+                } else {
+                    "○ "
+                },
+                Style::default().fg(if playback_focused {
+                    accent
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled(
+                "Sync watch history",
+                Style::default()
+                    .fg(if playback_focused {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        if self.config.watch_history && self.account_identity.is_none() {
+            playback_lines.push(Line::styled(
+                "Requires a signed-in account",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        playback_lines.push(Line::styled(
+            "Report plays to your YouTube Music account so watch history and",
+            Style::default().fg(Color::DarkGray),
+        ));
+        playback_lines.push(Line::styled(
+            "recommendations stay in sync. [←] [→] [Enter] toggle",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(
+            Paragraph::new(playback_lines).wrap(Wrap { trim: true }),
+            playback_inner,
         );
     }
 

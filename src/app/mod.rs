@@ -26,6 +26,7 @@ use tokio::runtime::Runtime;
 const NAV_ITEMS: [&str; 3] = ["Home", "Search", "Settings"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const WATCH_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_ACCENT: usize = 10;
 const ACCENT_COLORS: [AccentColor; 14] = [
     AccentColor::new("Rosewater", 0xf5, 0xe0, 0xdc),
@@ -169,6 +170,7 @@ struct App {
     settings_state: ListState,
     settings_row: usize,
     animation_started: Instant,
+    last_watch_report: Option<Instant>,
 }
 
 impl App {
@@ -234,6 +236,7 @@ impl App {
             settings_state,
             settings_row: 0,
             animation_started: Instant::now(),
+            last_watch_report: None,
         }
     }
 
@@ -246,7 +249,9 @@ impl App {
             self.poll_play_request();
             self.poll_up_next();
             self.poll_player_events();
+            self.poll_watch_report();
             if self.poll_mpris_commands() {
+                self.finalize_watch_report();
                 return Ok(());
             }
             self.publish_mpris();
@@ -268,6 +273,7 @@ impl App {
                 if self.quit_confirmation {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('y') => {
+                            self.finalize_watch_report();
                             return Ok(());
                         }
                         KeyCode::Esc | KeyCode::Char('n') => self.quit_confirmation = false,
@@ -354,6 +360,8 @@ impl App {
                         KeyCode::Left | KeyCode::Char('h') if self.is_settings() => {
                             if self.settings_row == 0 {
                                 self.previous_accent();
+                            } else if self.settings_row == 2 {
+                                self.toggle_watch_history();
                             } else {
                                 self.focus = Focus::Nav;
                             }
@@ -362,6 +370,11 @@ impl App {
                             if self.is_settings() && self.settings_row == 0 =>
                         {
                             self.next_accent();
+                        }
+                        KeyCode::Right | KeyCode::Char('l')
+                            if self.is_settings() && self.settings_row == 2 =>
+                        {
+                            self.toggle_watch_history();
                         }
                         KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Nav,
                         KeyCode::Up | KeyCode::Char('k') if self.is_home_list() => {
@@ -380,12 +393,15 @@ impl App {
                             self.next_search();
                         }
                         KeyCode::Down | KeyCode::Char('j') if self.is_settings() => {
-                            self.settings_row = (self.settings_row + 1).min(1);
+                            self.settings_row = (self.settings_row + 1).min(2);
                         }
                         KeyCode::Enter if self.is_home_list() => self.select_home_item(),
                         KeyCode::Enter if self.is_search_list() => self.select_search_item(),
                         KeyCode::Enter if self.is_settings() && self.settings_row == 1 => {
                             self.open_cookie_input(CookieInputKind::NetscapeFile);
+                        }
+                        KeyCode::Enter if self.is_settings() && self.settings_row == 2 => {
+                            self.toggle_watch_history();
                         }
                         KeyCode::Char('c') if self.is_settings() && self.settings_row == 1 => {
                             self.open_cookie_input(CookieInputKind::Header);
@@ -631,6 +647,7 @@ impl App {
                 self.play_receiver = None;
                 self.player = None;
                 self.playback.stream_url = Some(stream.url.clone());
+                self.playback.watch_tracking = stream.tracking.clone();
                 if let Some(track) = &mut self.playback.track {
                     track.views = stream.views;
                     track.likes = stream.likes;
@@ -892,6 +909,23 @@ impl App {
         }
     }
 
+    fn toggle_watch_history(&mut self) {
+        self.config.watch_history = !self.config.watch_history;
+        if let Err(error) = self.config.save() {
+            self.notification = Some(Notification::warning("Config not saved", error));
+        }
+        let message = if self.config.watch_history {
+            if self.account_identity.is_some() {
+                "Plays will now sync to your YouTube Music watch history."
+            } else {
+                "Plays will sync once you sign in to YouTube Music."
+            }
+        } else {
+            "Playback is no longer reported to your watch history."
+        };
+        self.notification = Some(Notification::info("Watch history", message));
+    }
+
     fn open_cookie_input(&mut self, kind: CookieInputKind) {
         if self.auth_receiver.is_some() {
             self.notification = Some(Notification::info(
@@ -1069,15 +1103,21 @@ impl App {
             ));
             return;
         };
+        self.send_final_watch_report();
         self.player = None;
         self.pause_on_load = start_paused;
         self.pending_pause = None;
+        self.playback.watch_tracking = None;
+        self.last_watch_report = None;
         let video_id = track.video_id.clone();
         let title = track.title.clone();
+        let sync_history = self.config.watch_history && self.account_identity.is_some();
         let (sender, receiver) = mpsc::channel();
         let stream_video_id = video_id.clone();
         self.runtime.spawn(async move {
-            let result = ytmusic.get_audio_stream(&stream_video_id).await;
+            let result = ytmusic
+                .get_audio_stream(&stream_video_id, sync_history)
+                .await;
             let _ = sender.send(result);
         });
         if load_queue {
@@ -1161,6 +1201,8 @@ impl App {
     }
 
     fn stop_playback(&mut self) {
+        self.send_final_watch_report();
+        self.playback.watch_tracking = None;
         self.play_receiver = None;
         self.pause_on_load = false;
         self.pending_pause = None;
@@ -1205,6 +1247,7 @@ impl App {
         if has_next {
             self.next_track();
         } else {
+            self.send_final_watch_report();
             self.player = None;
             self.playback.status = PlaybackStatus::Stopped;
             self.notification = Some(Notification::info("Queue finished", "No next track."));
@@ -1293,12 +1336,95 @@ impl App {
 
     fn mark_playing(&mut self) {
         self.playback.status = PlaybackStatus::Playing;
+        self.report_watch_start();
         if let Some(track) = &self.playback.track {
             self.notification = Some(Notification::info(
                 "Now playing",
                 format!("Playing {} by {}", track.title, track.artist),
             ));
         }
+    }
+
+    fn poll_watch_report(&mut self) {
+        if !self.watch_reporting_enabled() {
+            return;
+        }
+        let Some(tracking) = self.playback.watch_tracking.clone() else {
+            return;
+        };
+        if !matches!(self.playback.status, PlaybackStatus::Playing) {
+            return;
+        }
+        if self
+            .last_watch_report
+            .is_some_and(|last| last.elapsed() < WATCH_REPORT_INTERVAL)
+        {
+            return;
+        }
+        let Some(ytmusic) = self.ytmusic.clone() else {
+            return;
+        };
+        let position = self.playback.position;
+        self.runtime.spawn(async move {
+            let _ = ytmusic.report_watch_time(&tracking, position, false).await;
+        });
+        self.last_watch_report = Some(Instant::now());
+    }
+
+    fn report_watch_start(&mut self) {
+        if !self.watch_reporting_enabled() {
+            return;
+        }
+        let Some(tracking) = self.playback.watch_tracking.clone() else {
+            return;
+        };
+        let Some(ytmusic) = self.ytmusic.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            let _ = ytmusic.report_playback_start(&tracking).await;
+        });
+        self.last_watch_report = Some(Instant::now());
+    }
+
+    fn send_final_watch_report(&mut self) {
+        let Some(tracking) = self.playback.watch_tracking.take() else {
+            self.last_watch_report = None;
+            return;
+        };
+        if !self.watch_reporting_enabled() {
+            self.last_watch_report = None;
+            return;
+        }
+        let Some(ytmusic) = self.ytmusic.clone() else {
+            return;
+        };
+        let position = self.playback.position;
+        self.runtime.spawn(async move {
+            let _ = ytmusic.report_watch_time(&tracking, position, true).await;
+        });
+        self.last_watch_report = None;
+    }
+
+    fn finalize_watch_report(&mut self) {
+        if !self.watch_reporting_enabled() {
+            return;
+        }
+        let Some(tracking) = self.playback.watch_tracking.take() else {
+            return;
+        };
+        let Some(ytmusic) = self.ytmusic.clone() else {
+            return;
+        };
+        let position = self.playback.position;
+        self.runtime.block_on(async move {
+            let _ = ytmusic.report_watch_time(&tracking, position, true).await;
+        });
+        self.last_watch_report = None;
+    }
+
+    fn watch_reporting_enabled(&self) -> bool {
+        self.config.watch_history && self.account_identity.is_some()
     }
 
     fn append_playback_diagnostic(&mut self, message: String) {

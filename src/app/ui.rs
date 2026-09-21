@@ -1,7 +1,5 @@
 use super::{ACCENT_COLORS, App, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES};
-use crate::app::model::{
-    Focus, HomeEntry, NotificationMode, PlaybackStatus, PlaybackTrack, QueueSource, Screen,
-};
+use crate::app::model::{Focus, NotificationMode, PlaybackStatus, Screen};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -477,7 +475,7 @@ impl App {
         );
     }
 
-    fn render_player_screen(&self, frame: &mut Frame) {
+    fn render_player_screen(&mut self, frame: &mut Frame) {
         let accent = self.accent_color();
         let [summary, tabs, content, help] = Layout::default()
             .direction(Direction::Vertical)
@@ -505,9 +503,11 @@ impl App {
             _ => unreachable!(),
         }
         frame.render_widget(
-            Paragraph::new(
-                " h/l or Tab: section  Space: pause  [/] seek  n/p: track  Esc/P: back  q: quit ",
-            )
+            Paragraph::new(if self.player_tab == 1 {
+                " h/l or Tab: section  j/k: select  Enter: play  n/p: track  Esc/P: back  q: quit "
+            } else {
+                " h/l or Tab: section  Space: pause  [/] seek  n/p: track  Esc/P: back  q: quit "
+            })
             .style(Style::default().fg(Color::DarkGray)),
             help,
         );
@@ -588,48 +588,68 @@ impl App {
         SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
     }
 
-    fn render_up_next(&self, frame: &mut Frame, area: Rect) {
-        let Some(source) = self.playback.source else {
+    fn render_up_next(&mut self, frame: &mut Frame, area: Rect) {
+        if self.playback.queue.is_empty() {
             frame.render_widget(Paragraph::new("The queue is empty."), area);
             return;
-        };
-        let current = self.playback.current_index.unwrap_or_default();
-        let items = match source {
-            QueueSource::Home(shelf) => self
-                .home_shelves
-                .get(shelf)
-                .into_iter()
-                .flat_map(|shelf| shelf.items.iter().skip(current + 1))
-                .filter_map(HomeEntry::playback_track)
-                .collect::<Vec<_>>(),
-            QueueSource::Search => self
-                .search_items
-                .iter()
-                .skip(current + 1)
-                .filter_map(|item| {
-                    item.video_id.as_ref().map(|video_id| PlaybackTrack {
-                        video_id: video_id.clone(),
-                        title: item.title.clone(),
-                        artist: item.detail.clone(),
-                        views: None,
-                        likes: None,
-                    })
-                })
-                .collect(),
-        };
-        if items.is_empty() {
-            frame.render_widget(Paragraph::new("Nothing else is queued."), area);
-            return;
         }
+        let accent = self.accent_color();
+        let [status, queue] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .areas(area);
+        let status_text = if self.playback.queue_loading {
+            format!("{}  Building Automix...", self.spinner_frame())
+        } else if let Some(error) = &self.playback.queue_error {
+            error.clone()
+        } else {
+            format!("Automix  ·  {} tracks", self.playback.queue.len())
+        };
         frame.render_widget(
-            List::new(items.into_iter().map(|track| {
-                ListItem::new(vec![
-                    Line::styled(track.title, Style::default().add_modifier(Modifier::BOLD)),
-                    Line::styled(track.artist, Style::default().fg(Color::DarkGray)),
-                ])
-            })),
-            area,
+            Paragraph::new(status_text).style(Style::default().fg(
+                if self.playback.queue_error.is_some() {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                },
+            )),
+            status,
         );
+        let current = self.playback.queue_index;
+        let items = self
+            .playback
+            .queue
+            .iter()
+            .enumerate()
+            .map(|(index, track)| {
+                let is_current = current == Some(index);
+                let detail = match &track.duration {
+                    Some(duration) if !duration.is_empty() => {
+                        format!("{}  ·  {duration}", track.artist)
+                    }
+                    _ => track.artist.clone(),
+                };
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            if is_current { "▶ " } else { "  " },
+                            Style::default().fg(if is_current { accent } else { Color::DarkGray }),
+                        ),
+                        Span::styled(
+                            track.title.clone(),
+                            Style::default()
+                                .fg(if is_current { accent } else { Color::White })
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
+                ])
+            });
+        let list = List::new(items)
+            .highlight_symbol("│ ")
+            .highlight_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
+            .repeat_highlight_symbol(true);
+        frame.render_stateful_widget(list, queue, &mut self.up_next_state);
     }
 
     fn render_search(&mut self, frame: &mut Frame, area: Rect) {

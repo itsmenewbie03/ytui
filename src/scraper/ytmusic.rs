@@ -16,6 +16,18 @@ pub struct AccountIdentity {
     pub username: Option<String>,
 }
 
+pub struct UpNextTrack {
+    pub video_id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration: Option<String>,
+}
+
+pub struct UpNextQueue {
+    pub tracks: Vec<UpNextTrack>,
+    pub current_index: usize,
+}
+
 #[derive(Clone)]
 pub struct YTMusic {
     yt: Innertube,
@@ -67,6 +79,31 @@ impl YTMusic {
 
     pub async fn search(&self, query: &str) -> innertube_rs::error::Result<MusicSearchResults> {
         self.yt.music().search(query, None).await
+    }
+
+    pub async fn get_up_next(&self, video_id: &str) -> innertube_rs::error::Result<UpNextQueue> {
+        let response = self
+            .yt
+            .session
+            .post_innertube_client(
+                "YTMUSIC",
+                "/next",
+                json!({
+                    "videoId": video_id,
+                    "playlistId": format!("RDAMVM{video_id}"),
+                    "enablePersistentPlaylistPanel": true,
+                    "isAudioOnly": true,
+                    "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+                }),
+            )
+            .await?;
+        let value: Value = response.json().await?;
+        let panel = find_playlist_panel(&value)
+            .and_then(innertube_rs::PlaylistPanelNode::from_value)
+            .ok_or_else(|| {
+                innertube_rs::InnertubeError::Other("Could not fetch Automix queue".to_owned())
+            })?;
+        Ok(up_next_queue(panel, video_id))
     }
 
     pub async fn get_audio_url(&self, video_id: &str) -> innertube_rs::error::Result<String> {
@@ -131,6 +168,44 @@ impl YTMusic {
             .await?;
         let value: Value = response.json().await?;
         Ok(find_like_count(&value))
+    }
+}
+
+fn up_next_queue(panel: innertube_rs::PlaylistPanelNode, current_video_id: &str) -> UpNextQueue {
+    let current_index = panel
+        .items
+        .iter()
+        .position(|item| item.selected)
+        .or_else(|| {
+            panel
+                .items
+                .iter()
+                .position(|item| item.id == current_video_id)
+        })
+        .unwrap_or_default();
+    let tracks = panel
+        .items
+        .into_iter()
+        .map(|item| UpNextTrack {
+            video_id: item.id,
+            title: item.title,
+            artist: item.author.unwrap_or_default(),
+            duration: item.duration,
+        })
+        .collect();
+    UpNextQueue {
+        tracks,
+        current_index,
+    }
+}
+
+fn find_playlist_panel(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(object) => object
+            .get("playlistPanelRenderer")
+            .or_else(|| object.values().find_map(find_playlist_panel)),
+        Value::Array(values) => values.iter().find_map(find_playlist_panel),
+        _ => None,
     }
 }
 
@@ -271,5 +346,51 @@ mod tests {
         let identity = parse_account_identity(&response).expect("account should parse");
         assert_eq!(identity.display_name, "Display Name");
         assert_eq!(identity.username, None);
+    }
+
+    #[test]
+    fn maps_automix_queue_and_selected_track() {
+        let panel = innertube_rs::PlaylistPanelNode {
+            title: "Up next".to_owned(),
+            playlist_id: Some("RDAMVM".to_owned()),
+            num_videos_text: Some("2 songs".to_owned()),
+            items: vec![
+                innertube_rs::PlaylistPanelVideoNode {
+                    id: "first".to_owned(),
+                    title: "First".to_owned(),
+                    author: Some("Artist One".to_owned()),
+                    duration: Some("3:10".to_owned()),
+                    selected: false,
+                },
+                innertube_rs::PlaylistPanelVideoNode {
+                    id: "current".to_owned(),
+                    title: "Current".to_owned(),
+                    author: Some("Artist Two".to_owned()),
+                    duration: Some("4:20".to_owned()),
+                    selected: true,
+                },
+            ],
+        };
+
+        let queue = up_next_queue(panel, "current");
+        assert_eq!(queue.current_index, 1);
+        assert_eq!(queue.tracks.len(), 2);
+        assert_eq!(queue.tracks[1].title, "Current");
+        assert_eq!(queue.tracks[1].duration.as_deref(), Some("4:20"));
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music compatibility probe"]
+    async fn loads_automix_without_authentication() {
+        let client = YTMusic::new(None)
+            .await
+            .expect("anonymous client should initialize");
+        let queue = client
+            .get_up_next("dQw4w9WgXcQ")
+            .await
+            .expect("anonymous Automix should load");
+
+        assert!(queue.tracks.len() > 1);
+        assert_eq!(queue.tracks[queue.current_index].video_id, "dQw4w9WgXcQ");
     }
 }

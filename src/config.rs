@@ -76,6 +76,13 @@ impl Credentials {
     }
 
     pub fn from_netscape_file(path: &str) -> Result<Self, String> {
+        let trimmed = path.trim_start();
+        if path.contains(['\r', '\n', '\t'])
+            || trimmed.starts_with("# HTTP Cookie File")
+            || trimmed.starts_with("# Netscape HTTP Cookie File")
+        {
+            return Err("enter the path to cookies.txt, not its contents".to_owned());
+        }
         let path = expand_home(path)?;
         let contents = fs::read_to_string(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -179,9 +186,7 @@ fn parse_netscape_cookies(input: &str) -> Result<String, String> {
         if fields[2] != "/" && !"/youtubei/v1/browse".starts_with(fields[2]) {
             continue;
         }
-        let expires = fields[4]
-            .parse::<u64>()
-            .map_err(|_| format!("invalid cookie expiration on line {}", index + 1))?;
+        let expires = parse_cookie_expiration(fields[4], index + 1)?;
         if expires != 0 && expires <= now {
             continue;
         }
@@ -192,6 +197,22 @@ fn parse_netscape_cookies(input: &str) -> Result<String, String> {
     }
 
     normalize_cookie(&cookies.join("; "))
+}
+
+fn parse_cookie_expiration(value: &str, line: usize) -> Result<u64, String> {
+    let (seconds, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(seconds, fraction)| {
+            (seconds, Some(fraction))
+        });
+    if fraction.is_some_and(|fraction| {
+        fraction.is_empty() || !fraction.chars().all(|character| character.is_ascii_digit())
+    }) {
+        return Err(format!("invalid cookie expiration on line {line}"));
+    }
+    seconds
+        .parse::<u64>()
+        .map_err(|_| format!("invalid cookie expiration on line {line}"))
 }
 
 fn expand_home(input: &str) -> Result<PathBuf, String> {
@@ -279,7 +300,7 @@ mod tests {
         let input = concat!(
             "# Netscape HTTP Cookie File\n",
             ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n",
-            "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsecret\n",
+            "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t9999999999.123\tSAPISID\tsecret\n",
             ".google.com\tTRUE\t/\tTRUE\t0\tNID\tignored\n",
             "www.youtube.com\tFALSE\t/\tTRUE\t0\tOTHER\tignored\n",
         );
@@ -295,6 +316,19 @@ mod tests {
             parse_netscape_cookies("SAPISID=secret").unwrap_err(),
             "file is not a Netscape cookies.txt export"
         );
+    }
+
+    #[test]
+    fn rejects_pasted_netscape_contents_as_file_path() {
+        let result = Credentials::from_netscape_file(
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsecret",
+        );
+        let error = match result {
+            Ok(_) => panic!("pasted contents should not be treated as a path"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "enter the path to cookies.txt, not its contents");
     }
 
     #[test]

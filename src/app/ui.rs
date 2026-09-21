@@ -876,7 +876,7 @@ impl App {
             return;
         }
         let width = area.width.saturating_sub(4).min(76);
-        let height = area.height.saturating_sub(2).min(15);
+        let height = area.height.saturating_sub(2).min(17);
         let popup = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -926,10 +926,24 @@ impl App {
                 Span::styled(input_label, Style::default().fg(Color::DarkGray)),
                 Span::styled(input_status, Style::default().fg(self.accent_color())),
             ]),
-            Line::styled(
-                "Credentials are hidden and saved with owner-only permissions.",
+        ]);
+        match self.cookie_input_kind {
+            CookieInputKind::NetscapeFile => lines.extend([
+                Line::styled(
+                    "Only a filtered private credential is saved; the export is not copied.",
+                    Style::default().fg(Color::Yellow),
+                ),
+                Line::styled(
+                    "The source file stays unchanged. Delete it after a successful import.",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            CookieInputKind::Header => lines.push(Line::styled(
+                "The cookie is hidden and saved with owner-only permissions.",
                 Style::default().fg(Color::Yellow),
-            ),
+            )),
+        }
+        lines.extend([
             Line::default(),
             Line::styled(
                 "Enter: validate and save    Esc: cancel",

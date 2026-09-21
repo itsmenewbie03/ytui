@@ -981,12 +981,12 @@ impl App {
         );
         let lines = vec![
             Line::styled(
-                "Quit ytui and stop playback?",
+                "Press q again to quit and stop playback",
                 Style::default().fg(Color::White),
             ),
             Line::default(),
             Line::from(vec![
-                Span::styled("Enter/y", Style::default().fg(self.accent_color()).bold()),
+                Span::styled("q/Enter/y", Style::default().fg(self.accent_color()).bold()),
                 Span::styled(" quit    ", Style::default().fg(Color::DarkGray)),
                 Span::styled("Esc/n", Style::default().fg(Color::Gray).bold()),
                 Span::styled(" cancel", Style::default().fg(Color::DarkGray)),

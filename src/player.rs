@@ -13,6 +13,7 @@ use std::{
 pub enum PlayerEvent {
     FileLoaded,
     Position(f64),
+    Seeked(f64),
     Duration(f64),
     Paused(bool),
     EndOfFile,
@@ -118,12 +119,18 @@ impl MpvPlayer {
         Ok(player)
     }
 
-    pub fn toggle_pause(&mut self) -> io::Result<()> {
-        self.command(json!(["cycle", "pause"]))
+    pub fn set_paused(&mut self, paused: bool) -> io::Result<()> {
+        self.command(json!(["set_property", "pause", paused]))
     }
 
-    pub fn seek(&mut self, seconds: i64) -> io::Result<()> {
-        self.command(json!(["seek", seconds, "relative", "exact"]))
+    pub fn seek(&mut self, seconds: f64) -> io::Result<()> {
+        self.command(json!(["seek", seconds, "relative", "exact"]))?;
+        self.command_with_request(json!(["get_property", "time-pos"]), 4)
+    }
+
+    pub fn seek_absolute(&mut self, seconds: f64) -> io::Result<()> {
+        self.command(json!(["seek", seconds, "absolute", "exact"]))?;
+        self.command_with_request(json!(["get_property", "time-pos"]), 4)
     }
 
     pub fn try_recv(&self) -> Result<PlayerEvent, TryRecvError> {
@@ -133,6 +140,16 @@ impl MpvPlayer {
     fn command(&mut self, command: Value) -> io::Result<()> {
         serde_json::to_writer(&mut self.command_stream, &json!({ "command": command }))
             .map_err(io::Error::other)?;
+        self.command_stream.write_all(b"\n")?;
+        self.command_stream.flush()
+    }
+
+    fn command_with_request(&mut self, command: Value, request_id: u64) -> io::Result<()> {
+        serde_json::to_writer(
+            &mut self.command_stream,
+            &json!({ "command": command, "request_id": request_id }),
+        )
+        .map_err(io::Error::other)?;
         self.command_stream.write_all(b"\n")?;
         self.command_stream.flush()
     }
@@ -178,6 +195,15 @@ fn read_events(stream: UnixStream, sender: mpsc::Sender<PlayerEvent>) {
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+
+        if message.get("request_id").and_then(Value::as_u64) == Some(4) {
+            if let Some(position) = message.get("data").and_then(Value::as_f64)
+                && sender.send(PlayerEvent::Seeked(position)).is_err()
+            {
+                break;
+            }
+            continue;
+        }
 
         let event = match message.get("event").and_then(Value::as_str) {
             Some("file-loaded") => Some(PlayerEvent::FileLoaded),

@@ -633,7 +633,7 @@ impl App {
                 ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(
-                            if is_current { "▶ " } else { "  " },
+                            if is_current { " " } else { "  " },
                             Style::default().fg(if is_current { accent } else { Color::DarkGray }),
                         ),
                         Span::styled(

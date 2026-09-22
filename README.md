@@ -12,6 +12,7 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 - Browse YouTube Music home shelves
 - Sign in with a browser cookie for personalized account data
 - Search for songs, videos, albums, artists, and playlists
+- Play read-only playlists end to end, then hand off to Automix
 - Build interactive Up Next queues from YouTube Music Automix
 - Play the highest-quality available audio stream through `mpv`
 - Pause, seek, and move through the current queue
@@ -91,6 +92,12 @@ Treat both files like passwords: the cookies grant access to your YouTube accoun
 ### 🎥 Optional Watch History Sync
 
 When signed in, open **Settings**, move to **Playback**, and toggle **Sync watch history** (`h` / `l` / `Enter`) to report plays to your YouTube Music account. This keeps your watch history and personalized recommendations in sync. It is off by default, and playback otherwise remains anonymous.
+
+### 🎶 Playlist Playback
+
+Selecting a playlist starts it from its first track, exactly like YouTube Music Web. Playlists are read-only: ytui loads the full track list (including paginated playlists), plays tracks in order, and shows the remaining tracks in the Up Next queue. When the playlist's final track ends, an Automix seeded from that last track keeps the music going.
+
+Playlists can be opened from a **Home** shelf or a **Search** result. Mix cards such as **Listen Again** keep their web behavior: pressing `Enter` starts the featured track immediately with its generated mix queue.
 
 ## ⌨️ Controls
 

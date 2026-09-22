@@ -1,5 +1,4 @@
-use crate::scraper::ytmusic::{WatchTracking, YTMusicSearchResults};
-use innertube_rs::MusicHomeFeed;
+use crate::scraper::ytmusic::{WatchTracking, YTMusicHomeFeed, YTMusicSearchResults};
 use ratatui::style::Color;
 use std::time::{Duration, Instant};
 
@@ -18,6 +17,7 @@ pub(super) enum Screen {
 pub(super) enum HomeEntry {
     Track {
         video_id: String,
+        playlist_id: Option<String>,
         title: String,
         artist: String,
         album: Option<String>,
@@ -66,6 +66,7 @@ impl HomeEntry {
             artist,
             album,
             art_url,
+            ..
         } = self
         else {
             return None;
@@ -80,6 +81,13 @@ impl HomeEntry {
             views: None,
             likes: None,
         })
+    }
+
+    pub(super) fn playlist_id(&self) -> Option<&str> {
+        match self {
+            Self::Track { playlist_id, .. } => playlist_id.as_deref(),
+            Self::Album { .. } | Self::Playlist { .. } => None,
+        }
     }
 
     pub(super) fn browse_message(&self) -> String {
@@ -105,6 +113,7 @@ pub(super) struct SearchItem {
     pub(super) title: String,
     pub(super) detail: String,
     pub(super) video_id: Option<String>,
+    pub(super) browse_id: Option<String>,
     pub(super) album: Option<String>,
     pub(super) art_url: Option<String>,
 }
@@ -209,8 +218,9 @@ impl Notification {
     }
 }
 
-pub(super) fn home_shelves(feed: MusicHomeFeed) -> Vec<HomeShelf> {
+pub(super) fn home_shelves(feed: YTMusicHomeFeed) -> Vec<HomeShelf> {
     let mut shelves = feed
+        .feed
         .shelves
         .into_iter()
         .map(|shelf| {
@@ -226,6 +236,7 @@ pub(super) fn home_shelves(feed: MusicHomeFeed) -> Vec<HomeShelf> {
                         .join(", ");
                     HomeEntry::Track {
                         video_id: track.video_id,
+                        playlist_id: None,
                         title: track.title,
                         artist: if artist.is_empty() {
                             "Unknown artist".to_owned()
@@ -243,12 +254,40 @@ pub(super) fn home_shelves(feed: MusicHomeFeed) -> Vec<HomeShelf> {
                 artist: album.artist.unwrap_or_else(|| "Unknown artist".to_owned()),
             }));
             items.extend(shelf.playlists.into_iter().map(|playlist| {
-                HomeEntry::Playlist {
-                    browse_id: playlist.browse_id,
-                    title: playlist.title,
-                    author: playlist
+                let play_target = feed.play_targets.iter().find(|target| {
+                    target.item_id == playlist.browse_id && target.title == playlist.title
+                });
+                if let Some(target) = play_target
+                    && target.video_id.as_deref() == Some(playlist.browse_id.as_str())
+                    && let Some(video_id) = &target.video_id
+                {
+                    let artist = playlist
                         .author
-                        .unwrap_or_else(|| "YouTube Music".to_owned()),
+                        .as_deref()
+                        .and_then(|author| {
+                            author
+                                .strip_prefix("Song • ")
+                                .or_else(|| author.strip_prefix("Video • "))
+                        })
+                        .or(playlist.author.as_deref())
+                        .unwrap_or("Unknown artist")
+                        .to_owned();
+                    HomeEntry::Track {
+                        video_id: video_id.clone(),
+                        playlist_id: target.playlist_id.clone(),
+                        title: playlist.title,
+                        artist,
+                        album: None,
+                        art_url: playlist.thumbnail,
+                    }
+                } else {
+                    HomeEntry::Playlist {
+                        browse_id: playlist.browse_id,
+                        title: playlist.title,
+                        author: playlist
+                            .author
+                            .unwrap_or_else(|| "YouTube Music".to_owned()),
+                    }
                 }
             }));
             HomeShelf {
@@ -292,6 +331,7 @@ pub(super) fn search_items(results: YTMusicSearchResults) -> Vec<SearchItem> {
                     artists
                 },
                 video_id: Some(track.video_id),
+                browse_id: None,
                 album: track.album.map(|album| album.title),
                 art_url: track.thumbnail,
             }
@@ -302,6 +342,7 @@ pub(super) fn search_items(results: YTMusicSearchResults) -> Vec<SearchItem> {
         title: album.title,
         detail: album.artist.unwrap_or_else(|| "Unknown artist".to_owned()),
         video_id: None,
+        browse_id: Some(album.browse_id),
         album: None,
         art_url: None,
     }));
@@ -310,6 +351,7 @@ pub(super) fn search_items(results: YTMusicSearchResults) -> Vec<SearchItem> {
         title: artist.name,
         detail: artist.subscribers.unwrap_or_default(),
         video_id: None,
+        browse_id: Some(artist.browse_id),
         album: None,
         art_url: None,
     }));
@@ -321,6 +363,7 @@ pub(super) fn search_items(results: YTMusicSearchResults) -> Vec<SearchItem> {
                 .author
                 .unwrap_or_else(|| "YouTube Music".to_owned()),
             video_id: None,
+            browse_id: Some(playlist.browse_id),
             album: None,
             art_url: None,
         }
@@ -345,6 +388,7 @@ pub(super) fn search_items(results: YTMusicSearchResults) -> Vec<SearchItem> {
                 title: top.title,
                 detail: top.detail,
                 video_id: top.video_id,
+                browse_id: top.browse_id,
                 album: None,
                 art_url: top.art_url,
             },
@@ -356,8 +400,45 @@ pub(super) fn search_items(results: YTMusicSearchResults) -> Vec<SearchItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scraper::ytmusic::MusicSearchTopResult;
-    use innertube_rs::{MusicSearchResults, MusicTrackItem};
+    use crate::scraper::ytmusic::{HomePlayTarget, MusicSearchTopResult};
+    use innertube_rs::{
+        MusicHomeFeed, MusicPlaylistItem, MusicSearchResults, MusicShelf, MusicTrackItem,
+    };
+
+    #[test]
+    fn turns_playable_listen_again_card_into_track() {
+        let shelves = home_shelves(YTMusicHomeFeed {
+            feed: MusicHomeFeed {
+                shelves: vec![MusicShelf {
+                    title: "Listen again".to_owned(),
+                    playlists: vec![MusicPlaylistItem {
+                        browse_id: "8i_VTKjtRkk".to_owned(),
+                        title: "Wala Man Sa'yo Ang Lahat".to_owned(),
+                        author: Some("Song • Myrus".to_owned()),
+                        thumbnail: Some("https://example.com/art.jpg".to_owned()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            play_targets: vec![HomePlayTarget {
+                item_id: "8i_VTKjtRkk".to_owned(),
+                title: "Wala Man Sa'yo Ang Lahat".to_owned(),
+                video_id: Some("8i_VTKjtRkk".to_owned()),
+                playlist_id: Some("RDAMVM8i_VTKjtRkk".to_owned()),
+            }],
+        });
+
+        let entry = &shelves[0].items[0];
+        assert_eq!(entry.kind(), "Song");
+        assert_eq!(entry.detail(), "Myrus");
+        assert_eq!(entry.playlist_id(), Some("RDAMVM8i_VTKjtRkk"));
+        assert_eq!(
+            entry.playback_track().map(|track| track.video_id),
+            Some("8i_VTKjtRkk".to_owned())
+        );
+    }
 
     #[test]
     fn puts_top_search_result_first_without_duplicates() {
@@ -367,6 +448,7 @@ mod tests {
                 title: "Ganda Mo".to_owned(),
                 detail: "Cue C".to_owned(),
                 video_id: Some("top-video".to_owned()),
+                browse_id: None,
                 art_url: Some("https://example.com/top.jpg".to_owned()),
             }),
             sections: MusicSearchResults {

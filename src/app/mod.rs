@@ -3,21 +3,21 @@ mod mpris;
 mod ui;
 
 use self::model::{
-    Focus, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack, Screen,
-    SearchItem, home_shelves, search_items,
+    Focus, HomeEntry, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack,
+    Screen, SearchItem, home_shelves, search_items,
 };
 use self::mpris::{MprisCommand, MprisService, MprisSnapshot};
 use crate::config::{Config, Credentials, MiniPlayerLayout};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
 use crate::scraper::ytmusic::{
-    AccountIdentity, AudioStreamInfo, UpNextQueue, YTMusic, YTMusicSearchResults,
+    AccountIdentity, AudioStreamInfo, PlaylistPlayback, UpNextQueue, YTMusic, YTMusicHomeFeed,
+    YTMusicSearchResults,
 };
 use color_eyre::eyre::{Context, Result};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
     execute,
 };
-use innertube_rs::MusicHomeFeed;
 use ratatui::{DefaultTerminal, style::Color, widgets::ListState};
 use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -48,6 +48,7 @@ const ACCENT_COLORS: [AccentColor; 14] = [
 ];
 type PlayRequestResult = innertube_rs::error::Result<AudioStreamInfo>;
 type UpNextRequestResult = innertube_rs::error::Result<UpNextQueue>;
+type PlaylistRequestResult = innertube_rs::error::Result<PlaylistPlayback>;
 type SearchRequestResult = innertube_rs::error::Result<YTMusicSearchResults>;
 type InitRequestResult = innertube_rs::error::Result<(YTMusic, Option<AccountIdentity>)>;
 type AuthRequestResult = innertube_rs::error::Result<(YTMusic, AccountIdentity, Credentials)>;
@@ -79,6 +80,12 @@ impl AccentColor {
 enum CookieInputKind {
     NetscapeFile,
     Header,
+}
+
+#[derive(Clone, Copy)]
+enum UpNextLoadMode {
+    Replace,
+    Append,
 }
 
 pub fn run() -> Result<()> {
@@ -148,13 +155,15 @@ struct App {
     cookie_input_kind: CookieInputKind,
     has_credentials: bool,
     account_identity: Option<AccountIdentity>,
-    home_receiver: Option<Receiver<innertube_rs::error::Result<MusicHomeFeed>>>,
+    home_receiver: Option<Receiver<innertube_rs::error::Result<YTMusicHomeFeed>>>,
     home_shelves: Vec<HomeShelf>,
     home_shelf: usize,
     home_state: ListState,
     home_error: Option<String>,
     play_receiver: Option<Receiver<PlayRequestResult>>,
     up_next_receiver: Option<Receiver<UpNextRequestResult>>,
+    up_next_mode: UpNextLoadMode,
+    playlist_receiver: Option<Receiver<PlaylistRequestResult>>,
     up_next_state: ListState,
     pause_on_load: bool,
     pending_pause: Option<bool>,
@@ -173,6 +182,29 @@ struct App {
     settings_row: usize,
     animation_started: Instant,
     last_watch_report: Option<Instant>,
+}
+
+fn playback_track(track: crate::scraper::ytmusic::UpNextTrack) -> PlaybackTrack {
+    PlaybackTrack {
+        video_id: track.video_id,
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        art_url: track.art_url,
+        duration: track.duration,
+        views: None,
+        likes: None,
+    }
+}
+
+fn append_automix(queue: &mut Vec<PlaybackTrack>, automix: UpNextQueue) {
+    queue.extend(
+        automix
+            .tracks
+            .into_iter()
+            .skip(automix.current_index.saturating_add(1))
+            .map(playback_track),
+    );
 }
 
 impl App {
@@ -220,6 +252,8 @@ impl App {
             home_error: None,
             play_receiver: None,
             up_next_receiver: None,
+            up_next_mode: UpNextLoadMode::Replace,
+            playlist_receiver: None,
             up_next_state: ListState::default(),
             pause_on_load: false,
             pending_pause: None,
@@ -249,6 +283,7 @@ impl App {
             self.poll_home();
             self.poll_search();
             self.poll_play_request();
+            self.poll_playlist();
             self.poll_up_next();
             self.poll_player_events();
             self.poll_watch_report();
@@ -598,6 +633,7 @@ impl App {
         self.search_receiver = None;
         self.play_receiver = None;
         self.up_next_receiver = None;
+        self.playlist_receiver = None;
     }
 
     fn start_initialization(&mut self, cookie: Option<String>) {
@@ -616,6 +652,7 @@ impl App {
         self.search_receiver = None;
         self.play_receiver = None;
         self.up_next_receiver = None;
+        self.playlist_receiver = None;
     }
 
     fn poll_home(&mut self) {
@@ -699,6 +736,56 @@ impl App {
         }
     }
 
+    fn poll_playlist(&mut self) {
+        let Some(receiver) = &self.playlist_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(playlist)) => {
+                self.playlist_receiver = None;
+                let title = playlist.title;
+                let tracks = playlist
+                    .tracks
+                    .into_iter()
+                    .map(playback_track)
+                    .collect::<Vec<_>>();
+                let Some(first) = tracks.first().cloned() else {
+                    self.notification = Some(Notification::warning(
+                        "Playlist unavailable",
+                        "This playlist has no playable tracks.",
+                    ));
+                    return;
+                };
+                let last_video_id = tracks
+                    .last()
+                    .map(|track| track.video_id.clone())
+                    .unwrap_or_else(|| first.video_id.clone());
+                self.request_play(first, false, None, false);
+                self.playback.queue = tracks;
+                self.playback.queue_index = Some(0);
+                self.up_next_state.select(Some(0));
+                self.request_up_next(last_video_id, None, UpNextLoadMode::Append);
+                self.notification =
+                    Some(Notification::info("Playlist", format!("Playing {title}")));
+            }
+            Ok(Err(error)) => {
+                self.playlist_receiver = None;
+                self.notification = Some(Notification::error(
+                    "Playlist failed",
+                    format!("Could not load playlist: {error}"),
+                ));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.playlist_receiver = None;
+                self.notification = Some(Notification::error(
+                    "Playlist failed",
+                    "The playlist task stopped unexpectedly.",
+                ));
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     fn poll_up_next(&mut self) {
         let Some(receiver) = &self.up_next_receiver else {
             return;
@@ -708,20 +795,15 @@ impl App {
                 self.up_next_receiver = None;
                 self.playback.queue_loading = false;
                 self.playback.queue_error = None;
+                if matches!(self.up_next_mode, UpNextLoadMode::Append) {
+                    append_automix(&mut self.playback.queue, queue);
+                    return;
+                }
                 let current_track = self.playback.track.clone();
                 let mut tracks = queue
                     .tracks
                     .into_iter()
-                    .map(|track| PlaybackTrack {
-                        video_id: track.video_id,
-                        title: track.title,
-                        artist: track.artist,
-                        album: track.album,
-                        art_url: track.art_url,
-                        duration: track.duration,
-                        views: None,
-                        likes: None,
-                    })
+                    .map(playback_track)
                     .collect::<Vec<_>>();
                 let current_index = current_track.as_ref().and_then(|current| {
                     tracks
@@ -1092,7 +1174,13 @@ impl App {
         };
         let entry = &self.home_shelves[self.home_shelf].items[index];
         if let Some(track) = entry.playback_track() {
-            self.request_play(track, true, false);
+            let playlist_id = entry.playlist_id().map(ToOwned::to_owned);
+            self.request_play(track, true, playlist_id, false);
+        } else if let HomeEntry::Playlist {
+            browse_id, title, ..
+        } = entry
+        {
+            self.request_playlist(browse_id.clone(), title.clone());
         } else {
             self.notification = Some(Notification::info("Browse", entry.browse_message()));
         }
@@ -1117,7 +1205,12 @@ impl App {
                 views: None,
                 likes: None,
             };
-            self.request_play(track, true, false);
+            self.request_play(track, true, None, false);
+        } else if self.search_items[index].kind == "Playlist"
+            && let Some(browse_id) = self.search_items[index].browse_id.clone()
+        {
+            let title = self.search_items[index].title.clone();
+            self.request_playlist(browse_id, title);
         } else {
             self.notification = Some(Notification::warning(
                 "Not playable",
@@ -1126,7 +1219,7 @@ impl App {
         }
     }
 
-    fn request_play(&mut self, track: PlaybackTrack, load_queue: bool, start_paused: bool) {
+    fn request_playlist(&mut self, playlist_id: String, title: String) {
         let Some(ytmusic) = self.ytmusic.clone() else {
             self.notification = Some(Notification::warning(
                 "Not ready",
@@ -1134,6 +1227,30 @@ impl App {
             ));
             return;
         };
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(ytmusic.get_playlist(&playlist_id).await);
+        });
+        self.up_next_receiver = None;
+        self.playlist_receiver = Some(receiver);
+        self.notification = Some(Notification::info("Playlist", format!("Loading {title}")));
+    }
+
+    fn request_play(
+        &mut self,
+        track: PlaybackTrack,
+        load_queue: bool,
+        playlist_id: Option<String>,
+        start_paused: bool,
+    ) {
+        let Some(ytmusic) = self.ytmusic.clone() else {
+            self.notification = Some(Notification::warning(
+                "Not ready",
+                "YouTube Music is still initializing.",
+            ));
+            return;
+        };
+        self.playlist_receiver = None;
         self.send_final_watch_report();
         self.player = None;
         self.pause_on_load = start_paused;
@@ -1152,18 +1269,9 @@ impl App {
             let _ = sender.send(result);
         });
         if load_queue {
-            let Some(queue_client) = self.ytmusic.clone() else {
-                return;
-            };
-            let (sender, receiver) = mpsc::channel();
-            self.runtime.spawn(async move {
-                let _ = sender.send(queue_client.get_up_next(&video_id).await);
-            });
-            self.up_next_receiver = Some(receiver);
+            self.request_up_next(video_id, playlist_id, UpNextLoadMode::Replace);
             self.playback.queue = vec![track.clone()];
             self.playback.queue_index = Some(0);
-            self.playback.queue_loading = true;
-            self.playback.queue_error = None;
             self.up_next_state.select(Some(0));
         }
         self.play_receiver = Some(receiver);
@@ -1180,6 +1288,29 @@ impl App {
         self.playback.stream_url = None;
         self.playback.stream_copied = false;
         self.notification = Some(Notification::info("Loading", format!("Resolving {title}")));
+    }
+
+    fn request_up_next(
+        &mut self,
+        video_id: String,
+        playlist_id: Option<String>,
+        mode: UpNextLoadMode,
+    ) {
+        let Some(queue_client) = self.ytmusic.clone() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(
+                queue_client
+                    .get_up_next(&video_id, playlist_id.as_deref())
+                    .await,
+            );
+        });
+        self.up_next_receiver = Some(receiver);
+        self.up_next_mode = mode;
+        self.playback.queue_loading = true;
+        self.playback.queue_error = None;
     }
 
     fn toggle_pause(&mut self) {
@@ -1217,7 +1348,7 @@ impl App {
             PlaybackStatus::Stopped | PlaybackStatus::Error
         ) && let Some(track) = self.playback.track.clone()
         {
-            self.request_play(track, false, false);
+            self.request_play(track, false, None, false);
         }
     }
 
@@ -1310,7 +1441,7 @@ impl App {
             self.playback.stream_url = None;
         } else {
             let start_paused = matches!(self.playback.status, PlaybackStatus::Paused);
-            self.request_play(track, false, start_paused);
+            self.request_play(track, false, None, start_paused);
         }
     }
 
@@ -1320,7 +1451,7 @@ impl App {
         };
         self.playback.queue_index = Some(index);
         self.up_next_state.select(Some(index));
-        self.request_play(track, false, false);
+        self.request_play(track, false, None, false);
     }
 
     fn previous_up_next(&mut self) {
@@ -1489,5 +1620,55 @@ impl App {
 
     fn next_player_tab(&mut self) {
         self.player_tab = (self.player_tab + 1) % PLAYER_TABS.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scraper::ytmusic::UpNextTrack;
+
+    #[test]
+    fn appends_automix_after_its_seed_track() {
+        let mut queue = vec![playback("playlist-first"), playback("playlist-last")];
+        let automix = UpNextQueue {
+            tracks: vec![
+                up_next("before-seed"),
+                up_next("playlist-last"),
+                up_next("automix-first"),
+                up_next("automix-second"),
+            ],
+            current_index: 1,
+        };
+
+        append_automix(&mut queue, automix);
+
+        assert_eq!(
+            queue
+                .iter()
+                .map(|track| track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "playlist-first",
+                "playlist-last",
+                "automix-first",
+                "automix-second"
+            ]
+        );
+    }
+
+    fn playback(video_id: &str) -> PlaybackTrack {
+        playback_track(up_next(video_id))
+    }
+
+    fn up_next(video_id: &str) -> UpNextTrack {
+        UpNextTrack {
+            video_id: video_id.to_owned(),
+            title: video_id.to_owned(),
+            artist: "Artist".to_owned(),
+            album: None,
+            duration: None,
+            art_url: None,
+        }
     }
 }

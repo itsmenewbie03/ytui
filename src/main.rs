@@ -4,6 +4,7 @@ mod app;
 mod config;
 pub mod player;
 pub mod scraper;
+mod spectrum;
 
 fn main() -> Result<()> {
     color_eyre::install()?;

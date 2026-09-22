@@ -909,6 +909,13 @@ impl App {
                 PlayerEvent::Error(error) => self.playback_error(format!("mpv error: {error}")),
             }
         }
+        while let Some(spectrum) = self
+            .player
+            .as_ref()
+            .and_then(|player| player.try_recv_spectrum().ok())
+        {
+            self.playback.spectrum = spectrum;
+        }
     }
 
     fn poll_mpris_commands(&mut self) -> bool {

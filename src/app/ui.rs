@@ -7,8 +7,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph,
-        Wrap,
+        Block, BorderType, Borders, Clear, LineGauge, List, ListItem, Padding, Paragraph, Wrap,
     },
 };
 
@@ -392,7 +391,7 @@ impl App {
         if playback_header_y >= inner.bottom() {
             return;
         }
-        let playback_focused = is_focused && matches!(self.settings_row, 2 | 3);
+        let playback_focused = is_focused && matches!(self.settings_row, 2..=3);
         let watch_history_focused = is_focused && self.settings_row == 2;
         let mini_player_focused = is_focused && self.settings_row == 3;
         let playback_header = "PLAYBACK ";
@@ -683,10 +682,17 @@ impl App {
 
     fn render_player_screen(&mut self, frame: &mut Frame) {
         let accent = self.accent_color();
+        let summary_height = if frame.area().height >= 20 {
+            11
+        } else if frame.area().height >= 18 {
+            9
+        } else {
+            7
+        };
         let [summary, tabs, content, help] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
+                Constraint::Length(summary_height),
                 Constraint::Length(3),
                 Constraint::Min(3),
                 Constraint::Length(1),
@@ -702,10 +708,28 @@ impl App {
         let inner = block.inner(content);
         frame.render_widget(block, content);
         match self.player_tab {
-            0 => frame.render_widget(Paragraph::new("No lyrics loaded."), inner),
+            0 => render_player_empty_state(
+                frame,
+                inner,
+                "Lyrics unavailable",
+                "Synced lyrics will appear here when support lands.",
+                accent,
+            ),
             1 => self.render_up_next(frame, inner),
-            2 => frame.render_widget(Paragraph::new("Comments are not loaded yet."), inner),
-            3 => frame.render_widget(Paragraph::new("Related tracks are not loaded yet."), inner),
+            2 => render_player_empty_state(
+                frame,
+                inner,
+                "Comments unavailable",
+                "The conversation around this track is coming later.",
+                accent,
+            ),
+            3 => render_player_empty_state(
+                frame,
+                inner,
+                "Nothing related yet",
+                "More music like this will appear here.",
+                accent,
+            ),
             _ => unreachable!(),
         }
         frame.render_widget(
@@ -720,65 +744,270 @@ impl App {
     }
 
     fn render_player_summary(&self, frame: &mut Frame, area: Rect) {
+        let accent = self.accent_color();
         let block = Block::default()
-            .title(" Player ")
+            .title(" NOW PLAYING ")
+            .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent))
             .padding(Padding::horizontal(1));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        if self.playback.track.is_none() {
+            let message_area = Rect::new(inner.x, inner.y + inner.height / 2, inner.width, 1);
+            frame.render_widget(
+                Paragraph::new("Nothing playing  ·  choose a track from Home or Search")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                message_area,
+            );
+            return;
+        }
+
+        if inner.width >= 84 && inner.height >= 7 {
+            let [identity, transport] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+                .areas(inner);
+            self.render_player_identity(frame, identity);
+            self.render_player_transport(frame, transport, true);
+        } else {
+            self.render_player_compact(frame, inner);
+        }
+    }
+
+    fn render_player_identity(&self, frame: &mut Frame, area: Rect) {
         let Some(track) = &self.playback.track else {
-            frame.render_widget(Paragraph::new("Nothing is playing."), inner);
             return;
         };
-        let [details, progress, status] = Layout::default()
+        let [title, artist, album_area, _spacer, details] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+        frame.render_widget(
+            Paragraph::new(track.title.as_str()).style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            title,
+        );
+        frame.render_widget(
+            Paragraph::new(track.artist.as_str()).style(Style::default().fg(Color::Gray)),
+            artist,
+        );
+        if let Some(album) = distinct_album(track.artist.as_str(), track.album.as_deref()) {
+            frame.render_widget(
+                Paragraph::new(album).style(Style::default().fg(Color::DarkGray)),
+                album_area,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} views   {} likes",
+                format_count(track.views),
+                format_count(track.likes)
+            ))
+            .style(Style::default().fg(Color::DarkGray)),
+            details,
+        );
+    }
+
+    fn render_player_transport(&self, frame: &mut Frame, area: Rect, divided: bool) {
+        let accent = self.accent_color();
+        let container = if divided {
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .padding(Padding::left(2))
+        } else {
+            Block::default()
+        };
+        let inner = container.inner(area);
+        if divided {
+            frame.render_widget(container, area);
+        }
+        let [
+            status,
+            _visualizer_gap,
+            controls,
+            _spacer,
+            progress,
+            timestamps,
+            hint,
+        ] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .areas(inner);
+        if let Some(error) = &self.playback.error {
+            frame.render_widget(
+                Paragraph::new(error.as_str())
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::Red)),
+                status,
+            );
+        } else {
+            render_spectrum(
+                frame,
+                status,
+                &self.playback.spectrum,
+                matches!(self.playback.status, PlaybackStatus::Playing),
+                accent,
+            );
+        }
+        let play_icon = if matches!(self.playback.status, PlaybackStatus::Paused) {
+            ""
+        } else {
+            ""
+        };
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    track.title.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(
-                    format!("{}  -  {}", track.artist, track.video_id),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            details,
+            Paragraph::new(format!("󰒮       {play_icon}       󰒭"))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            controls,
         );
-        frame.render_widget(self.progress_gauge(), progress);
-        let status_line = self
-            .playback
-            .error
-            .as_deref()
-            .unwrap_or(self.playback.status.label());
         frame.render_widget(
-            Paragraph::new(status_line)
-                .style(if self.playback.error.is_some() {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                })
-                .wrap(Wrap { trim: true }),
-            status,
+            LineGauge::default()
+                .ratio(self.playback_ratio())
+                .filled_style(Style::default().fg(accent))
+                .unfilled_style(Style::default().fg(Color::DarkGray))
+                .label(""),
+            progress,
+        );
+        self.render_player_timestamps(frame, timestamps);
+        frame.render_widget(
+            Paragraph::new("[ / ] seek  ·  Space pause  ·  n / p skip")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+            hint,
         );
     }
 
-    fn progress_gauge(&self) -> Gauge<'static> {
-        Gauge::default()
-            .ratio(self.playback_ratio())
-            .gauge_style(Style::default().fg(self.accent_color()))
-            .label(format!(
-                "{} / {}",
-                format_time(self.playback.position),
-                format_time(self.playback.duration)
+    fn render_player_compact(&self, frame: &mut Frame, area: Rect) {
+        let Some(track) = &self.playback.track else {
+            return;
+        };
+        if area.height == 0 {
+            return;
+        }
+        let row = |offset| Rect::new(area.x, area.y + offset, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(track.title.as_str())
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            row(0),
+        );
+        if area.height >= 2 {
+            let metadata = distinct_album(track.artist.as_str(), track.album.as_deref())
+                .map_or_else(
+                    || track.artist.clone(),
+                    |album| format!("{}  ·  {album}", track.artist),
+                );
+            frame.render_widget(
+                Paragraph::new(metadata)
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                row(1),
+            );
+        }
+        let show_visualizer = area.height >= 9;
+        if show_visualizer {
+            render_spectrum(
+                frame,
+                Rect::new(area.x, area.y + 2, area.width, 3),
+                &self.playback.spectrum,
+                matches!(self.playback.status, PlaybackStatus::Playing),
+                self.accent_color(),
+            );
+        }
+        let controls_offset = if show_visualizer { 6 } else { 2 };
+        if area.height > controls_offset {
+            let play_icon = if matches!(self.playback.status, PlaybackStatus::Paused) {
+                ""
+            } else {
+                ""
+            };
+            frame.render_widget(
+                Paragraph::new(format!("󰒮     {play_icon}     󰒭"))
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::default()
+                            .fg(self.accent_color())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                row(controls_offset),
+            );
+        }
+        if area.height > controls_offset + 1 {
+            frame.render_widget(
+                LineGauge::default()
+                    .ratio(self.playback_ratio())
+                    .filled_style(Style::default().fg(self.accent_color()))
+                    .unfilled_style(Style::default().fg(Color::DarkGray))
+                    .label(""),
+                row(controls_offset + 1),
+            );
+        }
+        if area.height > controls_offset + 2 {
+            self.render_player_timestamps(frame, row(controls_offset + 2));
+        }
+    }
+
+    fn render_player_timestamps(&self, frame: &mut Frame, area: Rect) {
+        let [elapsed, queue, remaining] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(8),
+                Constraint::Min(1),
+                Constraint::Length(8),
+            ])
+            .areas(area);
+        let style = Style::default().fg(Color::DarkGray);
+        frame.render_widget(
+            Paragraph::new(format_time(self.playback.position)).style(style),
+            elapsed,
+        );
+        frame.render_widget(
+            Paragraph::new(self.queue_position())
+                .alignment(Alignment::Center)
+                .style(style),
+            queue,
+        );
+        frame.render_widget(
+            Paragraph::new(format_remaining(
+                self.playback.position,
+                self.playback.duration,
             ))
+            .alignment(Alignment::Right)
+            .style(style),
+            remaining,
+        );
+    }
+
+    fn queue_position(&self) -> String {
+        self.playback.queue_index.map_or_else(
+            || "No queue".to_owned(),
+            |index| format!("Track {} of {}", index + 1, self.playback.queue.len()),
+        )
     }
 
     fn playback_ratio(&self) -> f64 {
@@ -809,7 +1038,7 @@ impl App {
         } else if let Some(error) = &self.playback.queue_error {
             error.clone()
         } else {
-            format!("Automix  ·  {} tracks", self.playback.queue.len())
+            format!("AUTOMIX  ·  {} tracks", self.playback.queue.len())
         };
         frame.render_widget(
             Paragraph::new(status_text).style(Style::default().fg(
@@ -838,7 +1067,11 @@ impl App {
                 ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(
-                            if is_current { " " } else { "  " },
+                            if is_current {
+                                "  ".to_owned()
+                            } else {
+                                format!("{:02}  ", index + 1)
+                            },
                             Style::default().fg(if is_current { accent } else { Color::DarkGray }),
                         ),
                         Span::styled(
@@ -848,7 +1081,10 @@ impl App {
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]),
-                    Line::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
+                    Line::styled(
+                        format!("    {detail}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ])
             });
         let list = List::new(items)
@@ -1223,6 +1459,36 @@ fn mini_player_mode(layout: MiniPlayerLayout, width: u16) -> MiniPlayerMode {
     }
 }
 
+fn render_player_empty_state(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    detail: &str,
+    accent: Color,
+) {
+    let height = area.height.min(3);
+    let message_area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height) / 2,
+        area.width,
+        height,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("", Style::default().fg(accent)),
+            Line::styled(
+                title.to_owned(),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(detail.to_owned(), Style::default().fg(Color::DarkGray)),
+        ])
+        .alignment(Alignment::Center),
+        message_area,
+    );
+}
+
 const fn mini_player_height(mode: MiniPlayerMode) -> u16 {
     match mode {
         MiniPlayerMode::Standard => 5,
@@ -1277,6 +1543,70 @@ fn wrap_text(message: &str, max_width: usize) -> Vec<String> {
 fn format_time(seconds: f64) -> String {
     let seconds = seconds.max(0.0) as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn format_remaining(position: f64, duration: f64) -> String {
+    if duration <= 0.0 {
+        "--:--".to_owned()
+    } else {
+        format!("-{}", format_time((duration - position).max(0.0)))
+    }
+}
+
+fn render_spectrum(frame: &mut Frame, area: Rect, spectrum: &[f32], active: bool, color: Color) {
+    let lines = spectrum_lines(spectrum, area.width, active)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        area,
+    );
+}
+
+fn spectrum_lines(spectrum: &[f32], width: u16, active: bool) -> [String; 3] {
+    if spectrum.is_empty() || width == 0 {
+        return std::array::from_fn(|_| String::new());
+    }
+    let count = spectrum.len().min(usize::from(width).div_ceil(2)).max(1);
+    let levels = (0..count).map(|index| {
+        if active {
+            spectrum[index * spectrum.len() / count].clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+
+    // A centered mirrored mode needs font-safe upper fractional blocks to avoid
+    // disconnected columns. Keep bars as the only shipped style until that is solved.
+    std::array::from_fn(|row| {
+        let units_below = (2 - row) * 8;
+        levels
+            .clone()
+            .map(|level| {
+                let units = (level * 24.0).round() as usize;
+                let visible_units = units.saturating_sub(units_below).min(8);
+                lower_block(if row == 2 {
+                    visible_units.max(1)
+                } else {
+                    visible_units
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+fn lower_block(level: usize) -> char {
+    const LEVELS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    LEVELS[level.min(8)]
+}
+
+fn distinct_album<'a>(artist: &str, album: Option<&'a str>) -> Option<&'a str> {
+    album.filter(|album| !album.eq_ignore_ascii_case(artist))
 }
 
 fn format_count(count: Option<u64>) -> String {
@@ -1469,6 +1799,40 @@ mod tests {
         assert_eq!(format_count(Some(6_900)), "6.9k");
         assert_eq!(format_count(Some(2_000_000)), "2m");
         assert_eq!(format_count(None), "—");
+    }
+
+    #[test]
+    fn formats_remaining_playback_time() {
+        assert_eq!(format_remaining(65.0, 185.0), "-2:00");
+        assert_eq!(format_remaining(0.0, 0.0), "--:--");
+        assert_eq!(format_remaining(200.0, 185.0), "-0:00");
+    }
+
+    #[test]
+    fn hides_album_when_it_repeats_the_artist() {
+        assert_eq!(
+            distinct_album("David Archuleta", Some("David Archuleta")),
+            None
+        );
+        assert_eq!(
+            distinct_album("David Archuleta", Some("Crush")),
+            Some("Crush")
+        );
+        assert_eq!(distinct_album("David Archuleta", None), None);
+    }
+
+    #[test]
+    fn renders_three_row_spectrum_with_silence_baseline() {
+        let spectrum = [0.0, 0.5, 1.0];
+
+        assert_eq!(
+            spectrum_lines(&spectrum, 5, true),
+            ["    █", "  ▄ █", "▁ █ █"]
+        );
+        assert_eq!(
+            spectrum_lines(&spectrum, 5, false),
+            ["     ", "     ", "▁ ▁ ▁"]
+        );
     }
 
     #[test]

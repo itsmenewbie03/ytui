@@ -303,6 +303,12 @@ mod tests {
     }
 
     #[test]
+    fn ignores_retired_visualizer_setting() {
+        toml::from_str::<Config>("visualizer_style = \"mirrored_wave\"")
+            .expect("configs from the visualizer experiment should still load");
+    }
+
+    #[test]
     fn normalizes_cookie_header() {
         let cookie = normalize_cookie(" Cookie: SID=abc; SAPISID=secret ")
             .expect("valid cookie should normalize");

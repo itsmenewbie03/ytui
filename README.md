@@ -24,6 +24,11 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 
 The full player includes tabs for lyrics, the queue, comments, and related tracks. The queue is ready today; the other tabs are friendly placeholders for what comes next.
 
+## 🗺️ Planned Features
+
+- **SponsorBlock integration:** optionally detect and skip sponsored or other non-music segments during playback using [SponsorBlock](https://sponsor.ajay.app/).
+- **Synchronized lyrics:** populate the player Lyrics tab with lightweight line, word, and syllable timing inspired by [YouLy+](https://github.com/ibratabian17/YouLyPlus), including graceful fallback when detailed timing is unavailable.
+
 ## ⚙️ Requirements
 
 You must have the following available on your system:

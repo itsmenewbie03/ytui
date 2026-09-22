@@ -27,7 +27,7 @@ use tokio::runtime::Runtime;
 
 const NAV_ITEMS: [&str; 3] = ["Home", "Search", "Settings"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const WATCH_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_ACCENT: usize = 10;
 const ACCENT_COLORS: [AccentColor; 14] = [
@@ -1265,7 +1265,6 @@ impl App {
         self.playback.watch_tracking = None;
         self.last_watch_report = None;
         let video_id = track.video_id.clone();
-        let title = track.title.clone();
         let sync_history = self.config.watch_history && self.account_identity.is_some();
         let (sender, receiver) = mpsc::channel();
         let stream_video_id = video_id.clone();
@@ -1294,7 +1293,6 @@ impl App {
         self.playback.diagnostics.clear();
         self.playback.stream_url = None;
         self.playback.stream_copied = false;
-        self.notification = Some(Notification::info("Loading", format!("Resolving {title}")));
     }
 
     fn request_up_next(
@@ -1506,12 +1504,6 @@ impl App {
     fn mark_playing(&mut self) {
         self.playback.status = PlaybackStatus::Playing;
         self.report_watch_start();
-        if let Some(track) = &self.playback.track {
-            self.notification = Some(Notification::info(
-                "Now playing",
-                format!("Playing {} by {}", track.title, track.artist),
-            ));
-        }
     }
 
     fn poll_watch_report(&mut self) {

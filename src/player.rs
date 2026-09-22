@@ -1,3 +1,4 @@
+use crate::spectrum::{SPECTRUM_BANDS, SpectrumCapture};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -26,6 +27,8 @@ pub struct MpvPlayer {
     command_stream: UnixStream,
     events: Receiver<PlayerEvent>,
     socket_path: PathBuf,
+    _spectrum: Option<SpectrumCapture>,
+    spectrum_events: Option<Receiver<[f32; SPECTRUM_BANDS]>>,
 }
 
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
@@ -98,6 +101,15 @@ impl MpvPlayer {
             }
         };
         let (event_sender, events) = mpsc::channel();
+        let (spectrum, spectrum_events) = match SpectrumCapture::start() {
+            Ok((capture, events)) => (Some(capture), Some(events)),
+            Err(error) => {
+                let _ = event_sender.send(PlayerEvent::Diagnostic(format!(
+                    "audio visualizer unavailable: {error}"
+                )));
+                (None, None)
+            }
+        };
         let stderr = child.stderr.take();
         let stderr_sender = event_sender.clone();
         thread::spawn(move || read_events(reader_stream, event_sender));
@@ -110,6 +122,8 @@ impl MpvPlayer {
             command_stream,
             events,
             socket_path,
+            _spectrum: spectrum,
+            spectrum_events,
         };
         player.command(json!(["observe_property", 1, "time-pos"]))?;
         player.command(json!(["observe_property", 2, "duration"]))?;
@@ -135,6 +149,13 @@ impl MpvPlayer {
 
     pub fn try_recv(&self) -> Result<PlayerEvent, TryRecvError> {
         self.events.try_recv()
+    }
+
+    pub fn try_recv_spectrum(&self) -> Result<[f32; SPECTRUM_BANDS], TryRecvError> {
+        self.spectrum_events
+            .as_ref()
+            .ok_or(TryRecvError::Disconnected)?
+            .try_recv()
     }
 
     fn command(&mut self, command: Value) -> io::Result<()> {

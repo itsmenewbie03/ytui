@@ -1,4 +1,5 @@
 use crate::scraper::ytmusic::{WatchTracking, YTMusicHomeFeed, YTMusicSearchResults};
+use crate::spectrum::SPECTRUM_BANDS;
 use ratatui::style::Color;
 use std::time::{Duration, Instant};
 
@@ -145,6 +146,7 @@ pub(super) struct PlaybackState {
     pub(super) stream_url: Option<String>,
     pub(super) stream_copied: bool,
     pub(super) watch_tracking: Option<WatchTracking>,
+    pub(super) spectrum: [f32; SPECTRUM_BANDS],
 }
 #[derive(Default)]
 pub(super) enum PlaybackStatus {
@@ -156,20 +158,6 @@ pub(super) enum PlaybackStatus {
     Paused,
     Stopped,
     Error,
-}
-
-impl PlaybackStatus {
-    pub(super) fn label(&self) -> &'static str {
-        match self {
-            Self::Idle => "Idle",
-            Self::Resolving => "Resolving stream...",
-            Self::Loading => "Loading in mpv...",
-            Self::Playing => "Playing",
-            Self::Paused => "Paused",
-            Self::Stopped => "Stopped",
-            Self::Error => "Playback error",
-        }
-    }
 }
 
 pub(super) struct Notification {

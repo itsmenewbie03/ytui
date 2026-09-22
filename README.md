@@ -16,6 +16,7 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 - Build interactive Up Next queues from YouTube Music Automix
 - Play the highest-quality available audio stream through `mpv`
 - Pause, seek, and move through the current queue
+- Visualize playback with audio-reactive spectrum bars
 - Control playback from desktop media keys and MPRIS clients
 - See playback progress, duration, views, and likes at a glance
 - Navigate with Vim-style keys or arrow keys
@@ -27,11 +28,13 @@ The full player includes tabs for lyrics, the queue, comments, and related track
 
 You must have the following available on your system:
 
-- Linux or another Unix-like environment
+- Linux with PipeWire
 - A recent [Rust toolchain](https://www.rust-lang.org/tools/install) with Cargo
 - [`mpv`](https://mpv.io/) on your `PATH`
 - A [Nerd Font](https://www.nerdfonts.com/) for the transport icons
 - An internet connection
+
+Building requires the PipeWire development files (`pipewire` on Arch Linux or `libpipewire-0.3-dev` on Debian and Ubuntu).
 
 Clipboard support is optional. Install `wl-copy`, `xclip`, or `xsel` if you want to copy playback diagnostics from the app.
 
@@ -149,7 +152,7 @@ dbus-run-session -- cargo test registers_with_a_session_bus -- --ignored --nocap
 
 ## 🔌 How It Works
 
-ytui uses [`innertube-rs`](https://crates.io/crates/innertube-rs) to load YouTube Music data and resolve audio streams. Playback runs in a managed `mpv` process controlled through its JSON IPC socket, while [Ratatui](https://ratatui.rs/) and Crossterm power the terminal interface. A native MPRIS service bridges desktop media controls into the same playback state and command loop.
+ytui uses [`innertube-rs`](https://crates.io/crates/innertube-rs) to load YouTube Music data and resolve audio streams. Playback runs in a managed `mpv` process controlled through its JSON IPC socket, while [Ratatui](https://ratatui.rs/) and Crossterm power the terminal interface. CPAL captures the active PipeWire sink and `rustfft` turns its PCM samples into the player spectrum. A native MPRIS service bridges desktop media controls into the same playback state and command loop.
 
 ## 🤝 Contributing
 

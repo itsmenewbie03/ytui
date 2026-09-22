@@ -1,9 +1,9 @@
 use innertube_rs::{
     FormatFilter, FormatType, GetVideoInfoOptions, Innertube, MusicHomeFeed, MusicSearchResults,
-    QualityPreference, SessionOptions,
+    NodeListExt, Parser, QualityPreference, SessionOptions,
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 const MUSIC_ORIGIN: &str = "https://music.youtube.com";
 const MUSIC_CLIENT_ID: &str = "67";
@@ -33,12 +33,26 @@ pub struct MusicSearchTopResult {
     pub title: String,
     pub detail: String,
     pub video_id: Option<String>,
+    pub browse_id: Option<String>,
     pub art_url: Option<String>,
 }
 
 pub struct YTMusicSearchResults {
     pub top_result: Option<MusicSearchTopResult>,
     pub sections: MusicSearchResults,
+}
+
+pub struct YTMusicHomeFeed {
+    pub feed: MusicHomeFeed,
+    pub play_targets: Vec<HomePlayTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HomePlayTarget {
+    pub item_id: String,
+    pub title: String,
+    pub video_id: Option<String>,
+    pub playlist_id: Option<String>,
 }
 
 pub struct UpNextTrack {
@@ -53,6 +67,11 @@ pub struct UpNextTrack {
 pub struct UpNextQueue {
     pub tracks: Vec<UpNextTrack>,
     pub current_index: usize,
+}
+
+pub struct PlaylistPlayback {
+    pub title: String,
+    pub tracks: Vec<UpNextTrack>,
 }
 
 struct PanelExtras {
@@ -114,8 +133,17 @@ impl YTMusic {
         })
     }
 
-    pub async fn get_home(&self) -> innertube_rs::error::Result<MusicHomeFeed> {
-        self.yt.music().get_home().await
+    pub async fn get_home(&self) -> innertube_rs::error::Result<YTMusicHomeFeed> {
+        let response = self
+            .yt
+            .session
+            .post_innertube_client("YTMUSIC", "/browse", json!({ "browseId": "FEmusic_home" }))
+            .await?;
+        let raw: Value = response
+            .json()
+            .await
+            .map_err(innertube_rs::InnertubeError::Network)?;
+        parse_home_response(&raw)
     }
 
     pub async fn search(&self, query: &str) -> innertube_rs::error::Result<YTMusicSearchResults> {
@@ -128,29 +156,49 @@ impl YTMusic {
             .json()
             .await
             .map_err(innertube_rs::InnertubeError::Network)?;
-        let sections =
+        let mut sections =
             innertube_rs::endpoints::music::parse_music_search_response(query, None, &raw)?;
+        let mut playlists = parse_search_playlists(&raw);
+        if playlists.is_empty() {
+            let response = self
+                .yt
+                .session
+                .post_innertube_client(
+                    "YTMUSIC",
+                    "/search",
+                    json!({
+                        "query": query,
+                        "params": innertube_rs::MusicSearchFilter::Playlists.to_param_str(),
+                    }),
+                )
+                .await?;
+            let playlist_raw: Value = response
+                .json()
+                .await
+                .map_err(innertube_rs::InnertubeError::Network)?;
+            playlists = parse_search_playlists(&playlist_raw);
+        }
+        sections.songs.retain(|song| {
+            !playlists
+                .iter()
+                .any(|playlist| playlist.title == song.title)
+        });
+        sections.playlists = playlists;
         Ok(YTMusicSearchResults {
             top_result: parse_search_top_result(&raw),
             sections,
         })
     }
 
-    pub async fn get_up_next(&self, video_id: &str) -> innertube_rs::error::Result<UpNextQueue> {
+    pub async fn get_up_next(
+        &self,
+        video_id: &str,
+        playlist_id: Option<&str>,
+    ) -> innertube_rs::error::Result<UpNextQueue> {
         let response = self
             .yt
             .session
-            .post_innertube_client(
-                "YTMUSIC",
-                "/next",
-                json!({
-                    "videoId": video_id,
-                    "playlistId": format!("RDAMVM{video_id}"),
-                    "enablePersistentPlaylistPanel": true,
-                    "isAudioOnly": true,
-                    "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
-                }),
-            )
+            .post_innertube_client("YTMUSIC", "/next", up_next_payload(video_id, playlist_id))
             .await?;
         let value: Value = response.json().await?;
         let panel_value = find_playlist_panel(&value).ok_or_else(|| {
@@ -161,6 +209,46 @@ impl YTMusic {
         })?;
         let extras = parse_panel_extras(panel_value);
         Ok(up_next_queue(panel, video_id, extras))
+    }
+
+    pub async fn get_playlist(
+        &self,
+        playlist_id: &str,
+    ) -> innertube_rs::error::Result<PlaylistPlayback> {
+        let browse_id = if playlist_id.starts_with("VL") {
+            playlist_id.to_owned()
+        } else {
+            format!("VL{playlist_id}")
+        };
+        let response = self
+            .yt
+            .session
+            .post_innertube_client("YTMUSIC", "/browse", json!({ "browseId": browse_id }))
+            .await?;
+        let raw: Value = response.json().await?;
+        let title = find_music_playlist_title(&raw).unwrap_or_else(|| "Playlist".to_owned());
+        let (mut tracks, mut continuation) = parse_music_playlist_page(&raw);
+        let mut seen_continuations = HashSet::new();
+        while let Some(token) = continuation {
+            if !seen_continuations.insert(token.clone()) {
+                break;
+            }
+            let response = self
+                .yt
+                .session
+                .post_innertube_client("YTMUSIC", "/browse", json!({ "continuation": token }))
+                .await?;
+            let raw: Value = response.json().await?;
+            let (page_tracks, next) = parse_music_playlist_page(&raw);
+            tracks.extend(page_tracks);
+            continuation = next;
+        }
+        if tracks.is_empty() {
+            return Err(innertube_rs::InnertubeError::Other(
+                "Playlist has no playable tracks".to_owned(),
+            ));
+        }
+        Ok(PlaylistPlayback { title, tracks })
     }
 
     pub async fn get_audio_url(&self, video_id: &str) -> innertube_rs::error::Result<String> {
@@ -314,6 +402,168 @@ impl YTMusic {
         let value: Value = response.json().await?;
         Ok(find_like_count(&value))
     }
+}
+
+fn parse_music_playlist_page(raw: &Value) -> (Vec<UpNextTrack>, Option<String>) {
+    let shelf = find_music_playlist_shelf(raw).unwrap_or(raw);
+    let parsed = Parser::parse_tree(shelf);
+    let tracks = parsed
+        .find_music_items()
+        .into_iter()
+        .filter_map(|item| {
+            let video_id = item.id.clone().filter(|id| !id.is_empty())?;
+            let artist = item
+                .artists
+                .iter()
+                .map(|artist| artist.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(UpNextTrack {
+                video_id,
+                title: item.title.clone(),
+                artist: if artist.is_empty() {
+                    "Unknown artist".to_owned()
+                } else {
+                    artist
+                },
+                album: item.album.clone(),
+                duration: item.duration.clone(),
+                art_url: item.thumbnails.best_url().map(ToOwned::to_owned),
+            })
+        })
+        .collect();
+    (
+        tracks,
+        parsed
+            .find_continuation_token()
+            .or_else(|| find_continuation_token(shelf)),
+    )
+}
+
+fn find_continuation_token(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get("nextContinuationData")
+            .and_then(|data| data.get("continuation"))
+            .or_else(|| {
+                object
+                    .get("continuationCommand")
+                    .and_then(|command| command.get("token"))
+            })
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| object.values().find_map(find_continuation_token)),
+        Value::Array(values) => values.iter().find_map(find_continuation_token),
+        _ => None,
+    }
+}
+
+fn find_music_playlist_shelf(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(object) => object
+            .get("musicPlaylistShelfRenderer")
+            .or_else(|| object.get("musicPlaylistShelfContinuation"))
+            .or_else(|| object.values().find_map(find_music_playlist_shelf)),
+        Value::Array(values) => values.iter().find_map(find_music_playlist_shelf),
+        _ => None,
+    }
+}
+
+fn find_music_playlist_title(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in ["musicDetailHeaderRenderer", "musicResponsiveHeaderRenderer"] {
+                if let Some(header) = object.get(key)
+                    && let Some(title) = header.get("title").and_then(text_value)
+                {
+                    return Some(title);
+                }
+            }
+            object.values().find_map(find_music_playlist_title)
+        }
+        Value::Array(values) => values.iter().find_map(find_music_playlist_title),
+        _ => None,
+    }
+}
+
+fn up_next_payload(video_id: &str, playlist_id: Option<&str>) -> Value {
+    json!({
+        "videoId": video_id,
+        "playlistId": playlist_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("RDAMVM{video_id}")),
+        "enablePersistentPlaylistPanel": true,
+        "isAudioOnly": true,
+        "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+    })
+}
+
+fn parse_home_response(raw: &Value) -> innertube_rs::error::Result<YTMusicHomeFeed> {
+    let feed = innertube_rs::endpoints::music::parse_music_home_response(raw)?;
+    let mut play_targets = Vec::new();
+    collect_home_play_targets(raw, &mut play_targets);
+    Ok(YTMusicHomeFeed { feed, play_targets })
+}
+
+fn collect_home_play_targets(value: &Value, targets: &mut Vec<HomePlayTarget>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(renderer) = object.get("musicTwoRowItemRenderer")
+                && let Some(target) = parse_home_play_target(renderer)
+            {
+                targets.push(target);
+            }
+            for child in object.values() {
+                collect_home_play_targets(child, targets);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_home_play_targets(child, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_home_play_target(renderer: &Value) -> Option<HomePlayTarget> {
+    let navigation = renderer.get("navigationEndpoint")?;
+    let item_id = navigation
+        .pointer("/browseEndpoint/browseId")
+        .or_else(|| navigation.pointer("/watchEndpoint/videoId"))
+        .or_else(|| navigation.pointer("/watchPlaylistEndpoint/playlistId"))
+        .and_then(Value::as_str)?;
+    let play_navigation = renderer
+        .pointer(
+            "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint",
+        )
+        .unwrap_or(navigation);
+    let watch_endpoint = play_navigation
+        .get("watchEndpoint")
+        .or_else(|| play_navigation.pointer("/commandExecutorCommand/commands/0/watchEndpoint"))?;
+    let video_id = watch_endpoint
+        .get("videoId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let playlist_id = watch_endpoint
+        .get("playlistId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if video_id.is_none() && playlist_id.is_none() {
+        return None;
+    }
+    let title = renderer
+        .pointer("/title/runs/0/text")
+        .or_else(|| renderer.pointer("/title/simpleText"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some(HomePlayTarget {
+        item_id: item_id.to_owned(),
+        title,
+        video_id,
+        playlist_id,
+    })
 }
 
 async fn fetch_music_client_version(
@@ -565,6 +815,11 @@ fn parse_search_top_result(value: &Value) -> Option<MusicSearchTopResult> {
         .or_else(|| card.pointer("/buttons/0/buttonRenderer/command/watchEndpoint/videoId"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let browse_id = card
+        .pointer("/onTap/browseEndpoint/browseId")
+        .or_else(|| card.pointer("/buttons/0/buttonRenderer/command/browseEndpoint/browseId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let art_url = card
         .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
         .and_then(Value::as_array)
@@ -581,6 +836,7 @@ fn parse_search_top_result(value: &Value) -> Option<MusicSearchTopResult> {
         title,
         detail,
         video_id,
+        browse_id,
         art_url,
     })
 }
@@ -593,6 +849,80 @@ fn find_music_card(value: &Value) -> Option<&Value> {
         Value::Array(values) => values.iter().find_map(find_music_card),
         _ => None,
     }
+}
+
+fn parse_search_playlists(value: &Value) -> Vec<innertube_rs::MusicPlaylistItem> {
+    let mut playlists = Vec::new();
+    collect_search_playlists(value, &mut playlists);
+    playlists
+}
+
+fn collect_search_playlists(value: &Value, playlists: &mut Vec<innertube_rs::MusicPlaylistItem>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(renderer) = object.get("musicResponsiveListItemRenderer")
+                && let Some(playlist) = parse_search_playlist(renderer)
+                && !playlists
+                    .iter()
+                    .any(|existing| existing.browse_id == playlist.browse_id)
+            {
+                playlists.push(playlist);
+            }
+            for child in object.values() {
+                collect_search_playlists(child, playlists);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_search_playlists(child, playlists);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_search_playlist(renderer: &Value) -> Option<innertube_rs::MusicPlaylistItem> {
+    let title_run =
+        renderer.pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0")?;
+    let browse = renderer
+        .pointer("/navigationEndpoint/browseEndpoint")
+        .or_else(|| title_run.pointer("/navigationEndpoint/browseEndpoint"))?;
+    let page_type = browse
+        .pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+        .and_then(Value::as_str);
+    if page_type != Some("MUSIC_PAGE_TYPE_PLAYLIST") {
+        return None;
+    }
+    let browse_id = browse.get("browseId").and_then(Value::as_str)?.to_owned();
+    let title = title_run.get("text").and_then(Value::as_str)?.to_owned();
+    let detail = renderer
+        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text")
+        .and_then(text_value);
+    let author = detail.as_deref().and_then(|detail| {
+        detail
+            .split('•')
+            .map(str::trim)
+            .find(|part| !part.is_empty() && *part != "Playlist" && !part.contains("songs"))
+            .map(ToOwned::to_owned)
+    });
+    let thumbnail = renderer
+        .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+        .and_then(Value::as_array)
+        .and_then(|thumbnails| {
+            thumbnails
+                .iter()
+                .max_by_key(|thumbnail| thumbnail["width"].as_u64().unwrap_or_default())
+        })
+        .and_then(|thumbnail| thumbnail.get("url"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Some(innertube_rs::MusicPlaylistItem {
+        browse_id,
+        title,
+        author,
+        track_count: None,
+        thumbnail,
+    })
 }
 
 fn parse_account_identity(value: &Value) -> Option<AccountIdentity> {
@@ -681,6 +1011,175 @@ fn parse_count(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_playable_playlist_order() {
+        let response = json!({
+            "musicPlaylistShelfRenderer": {
+                "contents": [
+                    music_playlist_item(Some("first")),
+                    music_playlist_item(None),
+                    music_playlist_item(Some("last"))
+                ],
+                "continuations": [{
+                    "nextContinuationData": { "continuation": "next-page" }
+                }]
+            }
+        });
+        let (tracks, continuation) = parse_music_playlist_page(&response);
+
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "last"]
+        );
+        assert_eq!(continuation.as_deref(), Some("next-page"));
+    }
+
+    fn music_playlist_item(video_id: Option<&str>) -> Value {
+        json!({
+            "musicResponsiveListItemRenderer": {
+                "playlistItemData": { "videoId": video_id },
+                "flexColumns": [
+                    {
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": { "runs": [{ "text": video_id.unwrap_or("Unavailable") }] }
+                        }
+                    },
+                    {
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": { "runs": [{
+                                "text": "Artist",
+                                "navigationEndpoint": { "browseEndpoint": { "browseId": "UCartist" } }
+                            }] }
+                        }
+                    }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn extracts_playlist_browse_id_instead_of_seed_video_id() {
+        let response = json!({
+            "musicResponsiveListItemRenderer": {
+                "playlistItemData": { "videoId": "seed-video" },
+                "navigationEndpoint": {
+                    "browseEndpoint": {
+                        "browseId": "VLPLfocus",
+                        "browseEndpointContextSupportedConfigs": {
+                            "browseEndpointContextMusicConfig": {
+                                "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"
+                            }
+                        }
+                    }
+                },
+                "flexColumns": [
+                    {
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": { "runs": [{
+                                "text": "Focus Mix"
+                            }] }
+                        }
+                    },
+                    {
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": { "runs": [{ "text": "Playlist • YouTube Music • 50 songs" }] }
+                        }
+                    }
+                ]
+            }
+        });
+
+        let playlists = parse_search_playlists(&response);
+
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].browse_id, "VLPLfocus");
+        assert_eq!(playlists[0].title, "Focus Mix");
+    }
+
+    #[test]
+    fn extracts_play_target_from_home_card() {
+        let response = json!({
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicCarouselShelfRenderer": {
+                                            "header": {
+                                                "musicCarouselShelfBasicHeaderRenderer": {
+                                                    "title": { "runs": [{ "text": "Listen again" }] }
+                                                }
+                                            },
+                                            "contents": [{
+                                                "musicTwoRowItemRenderer": {
+                                                    "title": { "runs": [{ "text": "Wala Man Sa'yo Ang Lahat" }] },
+                                                    "subtitle": { "runs": [
+                                                        { "text": "Song" },
+                                                        { "text": " • " },
+                                                        { "text": "Myrus" }
+                                                    ] },
+                                                    "navigationEndpoint": {
+                                                        "watchEndpoint": {
+                                                            "videoId": "8i_VTKjtRkk",
+                                                            "playlistId": "RDAMVM8i_VTKjtRkk"
+                                                        }
+                                                    },
+                                                    "thumbnailRenderer": {
+                                                        "musicThumbnailRenderer": {
+                                                            "thumbnail": {
+                                                                "thumbnails": [{ "url": "https://example.com/art.jpg" }]
+                                                            }
+                                                        }
+                                                    },
+                                                    "overlay": {
+                                                        "musicItemThumbnailOverlayRenderer": {
+                                                            "content": {
+                                                                "musicPlayButtonRenderer": {
+                                                                    "playNavigationEndpoint": {
+                                                                        "watchEndpoint": {
+                                                                            "videoId": "8i_VTKjtRkk",
+                                                                            "playlistId": "RDAMVM8i_VTKjtRkk"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let feed = parse_home_response(&response).expect("home response should parse");
+        let target = feed
+            .play_targets
+            .first()
+            .expect("Listen Again card should be playable");
+
+        assert_eq!(target.video_id.as_deref(), Some("8i_VTKjtRkk"));
+        assert_eq!(target.playlist_id.as_deref(), Some("RDAMVM8i_VTKjtRkk"));
+    }
+
+    #[test]
+    fn uses_home_cards_playlist_context_for_up_next() {
+        let payload = up_next_payload("8i_VTKjtRkk", Some("RDAMVM8i_VTKjtRkk"));
+
+        assert_eq!(payload["videoId"], "8i_VTKjtRkk");
+        assert_eq!(payload["playlistId"], "RDAMVM8i_VTKjtRkk");
+    }
 
     #[test]
     fn extracts_like_count_from_accessibility_text() {
@@ -1012,12 +1511,73 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live YouTube Music compatibility probe"]
+    async fn loads_search_playlist_and_final_track_automix() {
+        let client = YTMusic::new(None)
+            .await
+            .expect("anonymous client should initialize");
+        let results = client
+            .search("lofi hip hop playlist")
+            .await
+            .expect("playlist search should load");
+        let playlist = results
+            .sections
+            .playlists
+            .first()
+            .expect("search should return a playlist");
+        let playback = client
+            .get_playlist(&playlist.browse_id)
+            .await
+            .expect("playlist should load");
+        let final_track = playback.tracks.last().expect("playlist should have tracks");
+        let automix = client
+            .get_up_next(&final_track.video_id, None)
+            .await
+            .expect("final track Automix should load");
+
+        assert!(!playback.tracks[0].video_id.is_empty());
+        assert_eq!(
+            automix.tracks[automix.current_index].video_id,
+            final_track.video_id
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music compatibility probe"]
+    async fn preserves_play_targets_from_personalized_home() {
+        let credentials = crate::config::Credentials::load()
+            .expect("credentials should load")
+            .expect("saved credentials are required");
+        let client = YTMusic::new(Some(credentials.cookie().to_owned()))
+            .await
+            .expect("authenticated client should initialize");
+        let feed = client.get_home().await.expect("home feed should load");
+        let target = feed
+            .play_targets
+            .iter()
+            .find(|target| target.title == "Wala Man Sa'yo Ang Lahat")
+            .expect("Listen Again card should retain its play endpoint");
+
+        assert_eq!(target.video_id.as_deref(), Some("8i_VTKjtRkk"));
+        assert_eq!(target.playlist_id.as_deref(), Some("RDAMVM8i_VTKjtRkk"));
+
+        let queue = client
+            .get_up_next(
+                target.video_id.as_deref().expect("card should have a seed"),
+                target.playlist_id.as_deref(),
+            )
+            .await
+            .expect("card queue should load");
+        assert_eq!(queue.tracks[queue.current_index].video_id, "8i_VTKjtRkk");
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music compatibility probe"]
     async fn loads_automix_without_authentication() {
         let client = YTMusic::new(None)
             .await
             .expect("anonymous client should initialize");
         let queue = client
-            .get_up_next("dQw4w9WgXcQ")
+            .get_up_next("dQw4w9WgXcQ", None)
             .await
             .expect("anonymous Automix should load");
 
@@ -1045,7 +1605,7 @@ mod tests {
             .await
             .expect("anonymous client should initialize");
         let queue = client
-            .get_up_next("LG5E5zeeWng")
+            .get_up_next("LG5E5zeeWng", None)
             .await
             .expect("anonymous Automix should load");
 
@@ -1074,7 +1634,7 @@ mod tests {
             .await
             .expect("anonymous client should initialize");
         let queue = client
-            .get_up_next("dHdMAdh4Xgc")
+            .get_up_next("dHdMAdh4Xgc", None)
             .await
             .expect("anonymous Automix should load");
 

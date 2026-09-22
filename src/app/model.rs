@@ -1,5 +1,5 @@
-use crate::scraper::ytmusic::WatchTracking;
-use innertube_rs::{MusicHomeFeed, MusicSearchResults};
+use crate::scraper::ytmusic::{WatchTracking, YTMusicSearchResults};
+use innertube_rs::MusicHomeFeed;
 use ratatui::style::Color;
 use std::time::{Duration, Instant};
 
@@ -267,7 +267,9 @@ pub(super) fn home_shelves(feed: MusicHomeFeed) -> Vec<HomeShelf> {
     shelves
 }
 
-pub(super) fn search_items(results: MusicSearchResults) -> Vec<SearchItem> {
+pub(super) fn search_items(results: YTMusicSearchResults) -> Vec<SearchItem> {
+    let top_result = results.top_result;
+    let results = results.sections;
     let tracks = results
         .songs
         .into_iter()
@@ -323,5 +325,72 @@ pub(super) fn search_items(results: MusicSearchResults) -> Vec<SearchItem> {
             art_url: None,
         }
     }));
+    if let Some(top) = top_result {
+        let kind = match top.kind.as_str() {
+            "Song" => "Song",
+            "Video" => "Video",
+            "Album" => "Album",
+            "Artist" => "Artist",
+            "Playlist" => "Playlist",
+            _ => "Top result",
+        };
+        items.retain(|item| match (&top.video_id, &item.video_id) {
+            (Some(top_id), Some(item_id)) => top_id != item_id,
+            _ => item.title != top.title || item.kind != kind,
+        });
+        items.insert(
+            0,
+            SearchItem {
+                kind,
+                title: top.title,
+                detail: top.detail,
+                video_id: top.video_id,
+                album: None,
+                art_url: top.art_url,
+            },
+        );
+    }
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scraper::ytmusic::MusicSearchTopResult;
+    use innertube_rs::{MusicSearchResults, MusicTrackItem};
+
+    #[test]
+    fn puts_top_search_result_first_without_duplicates() {
+        let results = YTMusicSearchResults {
+            top_result: Some(MusicSearchTopResult {
+                kind: "Song".to_owned(),
+                title: "Ganda Mo".to_owned(),
+                detail: "Cue C".to_owned(),
+                video_id: Some("top-video".to_owned()),
+                art_url: Some("https://example.com/top.jpg".to_owned()),
+            }),
+            sections: MusicSearchResults {
+                songs: vec![
+                    MusicTrackItem {
+                        video_id: "other-video".to_owned(),
+                        title: "Other result".to_owned(),
+                        ..Default::default()
+                    },
+                    MusicTrackItem {
+                        video_id: "top-video".to_owned(),
+                        title: "Ganda Mo".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+
+        let items = search_items(results);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Ganda Mo");
+        assert_eq!(items[0].video_id.as_deref(), Some("top-video"));
+        assert_eq!(items[1].title, "Other result");
+    }
 }

@@ -28,6 +28,19 @@ pub struct AccountIdentity {
     pub username: Option<String>,
 }
 
+pub struct MusicSearchTopResult {
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    pub video_id: Option<String>,
+    pub art_url: Option<String>,
+}
+
+pub struct YTMusicSearchResults {
+    pub top_result: Option<MusicSearchTopResult>,
+    pub sections: MusicSearchResults,
+}
+
 pub struct UpNextTrack {
     pub video_id: String,
     pub title: String,
@@ -105,8 +118,22 @@ impl YTMusic {
         self.yt.music().get_home().await
     }
 
-    pub async fn search(&self, query: &str) -> innertube_rs::error::Result<MusicSearchResults> {
-        self.yt.music().search(query, None).await
+    pub async fn search(&self, query: &str) -> innertube_rs::error::Result<YTMusicSearchResults> {
+        let response = self
+            .yt
+            .session
+            .post_innertube_client("YTMUSIC", "/search", json!({ "query": query }))
+            .await?;
+        let raw: Value = response
+            .json()
+            .await
+            .map_err(innertube_rs::InnertubeError::Network)?;
+        let sections =
+            innertube_rs::endpoints::music::parse_music_search_response(query, None, &raw)?;
+        Ok(YTMusicSearchResults {
+            top_result: parse_search_top_result(&raw),
+            sections,
+        })
     }
 
     pub async fn get_up_next(&self, video_id: &str) -> innertube_rs::error::Result<UpNextQueue> {
@@ -493,6 +520,81 @@ fn find_playlist_panel(value: &Value) -> Option<&Value> {
     }
 }
 
+fn parse_search_top_result(value: &Value) -> Option<MusicSearchTopResult> {
+    let card = find_music_card(value)?;
+    let title = card.get("title").and_then(text_value)?;
+    let subtitle_runs = card.pointer("/subtitle/runs").and_then(Value::as_array);
+    let kind = subtitle_runs
+        .and_then(|runs| runs.first())
+        .and_then(|run| run.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("Top result")
+        .to_owned();
+    let artists = subtitle_runs
+        .into_iter()
+        .flatten()
+        .filter(|run| {
+            run.pointer(
+                "/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType",
+            )
+            .and_then(Value::as_str)
+                == Some("MUSIC_PAGE_TYPE_ARTIST")
+        })
+        .filter_map(|run| run.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let detail = if artists.is_empty() {
+        subtitle_runs
+            .into_iter()
+            .flatten()
+            .filter_map(|run| run.get("text").and_then(Value::as_str))
+            .filter(|text| {
+                *text != kind
+                    && !text.contains('•')
+                    && !text
+                        .split(':')
+                        .all(|part| part.chars().all(|character| character.is_ascii_digit()))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        artists
+    };
+    let video_id = card
+        .pointer("/onTap/watchEndpoint/videoId")
+        .or_else(|| card.pointer("/buttons/0/buttonRenderer/command/watchEndpoint/videoId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let art_url = card
+        .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+        .and_then(Value::as_array)
+        .and_then(|thumbnails| {
+            thumbnails
+                .iter()
+                .max_by_key(|thumbnail| thumbnail["width"].as_u64().unwrap_or_default())
+        })
+        .and_then(|thumbnail| thumbnail.get("url"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(MusicSearchTopResult {
+        kind,
+        title,
+        detail,
+        video_id,
+        art_url,
+    })
+}
+
+fn find_music_card(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(object) => object
+            .get("musicCardShelfRenderer")
+            .or_else(|| object.values().find_map(find_music_card)),
+        Value::Array(values) => values.iter().find_map(find_music_card),
+        _ => None,
+    }
+}
+
 fn parse_account_identity(value: &Value) -> Option<AccountIdentity> {
     let account = find_account_item(value, true).or_else(|| find_account_item(value, false))?;
     let display_name = account.get("accountName").and_then(text_value)?;
@@ -738,6 +840,60 @@ mod tests {
     }
 
     #[test]
+    fn extracts_playable_top_result_from_music_card() {
+        let response = json!({
+            "contents": {
+                "musicCardShelfRenderer": {
+                    "thumbnail": {
+                        "musicThumbnailRenderer": {
+                            "thumbnail": {
+                                "thumbnails": [
+                                    { "url": "https://example.com/small.jpg" },
+                                    { "url": "https://example.com/large.jpg" }
+                                ]
+                            }
+                        }
+                    },
+                    "title": { "runs": [{ "text": "Ganda Mo" }] },
+                    "subtitle": {
+                        "runs": [
+                            { "text": "Song" },
+                            { "text": " • " },
+                            {
+                                "text": "Cue C",
+                                "navigationEndpoint": {
+                                    "browseEndpoint": {
+                                        "browseId": "UCartist",
+                                        "browseEndpointContextSupportedConfigs": {
+                                            "browseEndpointContextMusicConfig": {
+                                                "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            { "text": " • " },
+                            { "text": "4:46" }
+                        ]
+                    },
+                    "onTap": { "watchEndpoint": { "videoId": "0RloTSfzlyo" } }
+                }
+            }
+        });
+
+        let top = parse_search_top_result(&response).expect("top result should parse");
+
+        assert_eq!(top.kind, "Song");
+        assert_eq!(top.title, "Ganda Mo");
+        assert_eq!(top.detail, "Cue C");
+        assert_eq!(top.video_id.as_deref(), Some("0RloTSfzlyo"));
+        assert_eq!(
+            top.art_url.as_deref(),
+            Some("https://example.com/large.jpg")
+        );
+    }
+
+    #[test]
     fn extracts_watch_tracking_from_player_response() {
         let info = innertube_rs::VideoInfo {
             player_response: innertube_rs::PlayerResponse {
@@ -867,6 +1023,19 @@ mod tests {
 
         assert!(queue.tracks.len() > 1);
         assert_eq!(queue.tracks[queue.current_index].video_id, "dQw4w9WgXcQ");
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music compatibility probe"]
+    async fn includes_main_music_search_result() {
+        let client = YTMusic::new(None)
+            .await
+            .expect("anonymous client should initialize");
+        let results = client.search("ganda mo").await.expect("search should load");
+        let top = results.top_result.expect("main result should parse");
+
+        assert_eq!(top.title, "Ganda Mo");
+        assert_eq!(top.video_id.as_deref(), Some("0RloTSfzlyo"));
     }
 
     #[tokio::test]

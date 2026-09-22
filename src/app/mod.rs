@@ -9,13 +9,15 @@ use self::model::{
 use self::mpris::{MprisCommand, MprisService, MprisSnapshot};
 use crate::config::{Config, Credentials, MiniPlayerLayout};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
-use crate::scraper::ytmusic::{AccountIdentity, AudioStreamInfo, UpNextQueue, YTMusic};
+use crate::scraper::ytmusic::{
+    AccountIdentity, AudioStreamInfo, UpNextQueue, YTMusic, YTMusicSearchResults,
+};
 use color_eyre::eyre::{Context, Result};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
     execute,
 };
-use innertube_rs::{MusicHomeFeed, MusicSearchResults};
+use innertube_rs::MusicHomeFeed;
 use ratatui::{DefaultTerminal, style::Color, widgets::ListState};
 use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -46,7 +48,7 @@ const ACCENT_COLORS: [AccentColor; 14] = [
 ];
 type PlayRequestResult = innertube_rs::error::Result<AudioStreamInfo>;
 type UpNextRequestResult = innertube_rs::error::Result<UpNextQueue>;
-type SearchRequestResult = innertube_rs::error::Result<MusicSearchResults>;
+type SearchRequestResult = innertube_rs::error::Result<YTMusicSearchResults>;
 type InitRequestResult = innertube_rs::error::Result<(YTMusic, Option<AccountIdentity>)>;
 type AuthRequestResult = innertube_rs::error::Result<(YTMusic, AccountIdentity, Credentials)>;
 

@@ -28,6 +28,7 @@ The full player includes tabs for lyrics, the queue, comments, and related track
 
 - **SponsorBlock integration:** optionally detect and skip sponsored or other non-music segments during playback using [SponsorBlock](https://sponsor.ajay.app/).
 - **Synchronized lyrics:** populate the player Lyrics tab with lightweight line, word, and syllable timing inspired by [YouLy+](https://github.com/ibratabian17/YouLyPlus), including graceful fallback when detailed timing is unavailable.
+- **Mouse support:** enable clicking tabs, controls, navigation items, and tracks while preserving the keyboard-first workflow.
 
 ## ⚙️ Requirements
 

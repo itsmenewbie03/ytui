@@ -428,10 +428,13 @@ impl App {
                             self.next_up_next();
                         }
                         KeyCode::Down | KeyCode::Char('j') if self.player_tab == 0 => {
-                            let last = self
-                                .lyrics
-                                .as_ref()
-                                .map_or(0, |lyrics| lyrics.lines.len().saturating_sub(1));
+                            let last = self.lyrics.as_ref().map_or(0, |lyrics| {
+                                lyrics
+                                    .lines
+                                    .len()
+                                    .saturating_add(lyrics.footer_line_count())
+                                    .saturating_sub(1)
+                            });
                             self.lyrics_scroll = (self.lyrics_scroll + 1).min(last);
                         }
                         KeyCode::Enter if self.player_tab == 1 => self.play_selected_up_next(),
@@ -1546,6 +1549,7 @@ impl App {
             artist: track.artist.clone(),
             album: track.album.clone(),
             duration_seconds: track.duration.as_deref().and_then(parse_track_duration),
+            video_id: Some(video_id.clone()),
         };
         let (sender, receiver) = mpsc::channel();
         self.runtime.spawn(async move {

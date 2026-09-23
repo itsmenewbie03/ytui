@@ -5,6 +5,7 @@ use std::{error::Error, fmt, time::Duration};
 const BINILYRICS_SEARCH_URL: &str = "https://lyrics-api.binimum.org/getLyrics";
 const BINILYRICS_STORAGE_HOST: &str = "lyrics-storage.binimum.org";
 const LRCLIB_URL: &str = "https://lrclib.net/api/get";
+const UNISON_URL: &str = "https://unison.boidu.dev/lyrics";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -35,6 +36,7 @@ pub struct Lyrics {
     pub timing: LyricsTiming,
     pub lines: Vec<LyricLine>,
     pub source: String,
+    pub songwriters: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,7 @@ pub struct LyricsTrack {
     pub artist: String,
     pub album: Option<String>,
     pub duration_seconds: Option<u64>,
+    pub video_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -92,22 +95,32 @@ impl LyricsClient {
     }
 
     pub async fn fetch(&self, track: LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
-        let (bini, lrclib) = tokio::join!(self.fetch_binilyrics(&track), self.fetch_lrclib(&track));
-        let candidates = [bini.as_ref().ok(), lrclib.as_ref().ok()]
-            .into_iter()
-            .flatten()
-            .filter_map(|lyrics| lyrics.clone())
-            .collect::<Vec<_>>();
+        let (bini, unison, lrclib) = tokio::join!(
+            self.fetch_binilyrics(&track),
+            self.fetch_unison(&track),
+            self.fetch_lrclib(&track)
+        );
+        let candidates = [
+            bini.as_ref().ok(),
+            unison.as_ref().ok(),
+            lrclib.as_ref().ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|lyrics| lyrics.clone())
+        .collect::<Vec<_>>();
 
         if let Some(lyrics) = Lyrics::best_available(candidates) {
             return Ok(Some(lyrics));
         }
 
-        match (bini, lrclib) {
-            (Err(bini), Err(lrclib)) => Err(LyricsFetchError(format!(
-                "lyrics providers failed: {bini}; {lrclib}"
+        match (bini, unison, lrclib) {
+            (Err(bini), Err(unison), Err(lrclib)) => Err(LyricsFetchError(format!(
+                "lyrics providers failed: {bini}; {unison}; {lrclib}"
             ))),
-            (Err(error), Ok(None)) | (Ok(None), Err(error)) => Err(error),
+            (Err(error), Ok(None), Ok(None)) => Err(error),
+            (Ok(None), Err(error), Ok(None)) => Err(error),
+            (Ok(None), Ok(None), Err(error)) => Err(error),
             _ => Ok(None),
         }
     }
@@ -154,7 +167,7 @@ impl LyricsClient {
             .map_err(|error| LyricsFetchError(format!("BiniLyrics TTML is not UTF-8: {error}")))?;
         let mut lyrics = Lyrics::from_ttml(document)
             .map_err(|error| LyricsFetchError(format!("invalid BiniLyrics TTML: {error}")))?;
-        lyrics.source = "BiniLyrics".to_owned();
+        lyrics.source = "Apple (via BiniLyrics)".to_owned();
         Ok(Some(lyrics))
     }
 
@@ -184,6 +197,46 @@ impl LyricsClient {
             .map_err(|error| LyricsFetchError(format!("invalid LRCLIB response: {error}")))?;
         Ok(parse_lrclib(response))
     }
+
+    async fn fetch_unison(&self, track: &LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
+        if let Some(video_id) = track.video_id.as_deref()
+            && let Ok(Some(lyrics)) = self.fetch_unison_query(vec![("v", video_id)]).await
+        {
+            return Ok(Some(lyrics));
+        }
+
+        let mut query = vec![
+            ("song", track.title.as_str()),
+            ("artist", track.artist.as_str()),
+        ];
+        if let Some(album) = track.album.as_deref() {
+            query.push(("album", album));
+        }
+        let duration = track.duration_seconds.map(|duration| duration.to_string());
+        if let Some(duration) = duration.as_deref() {
+            query.push(("duration", duration));
+        }
+        self.fetch_unison_query(query).await
+    }
+
+    async fn fetch_unison_query(
+        &self,
+        query: Vec<(&str, &str)>,
+    ) -> Result<Option<Lyrics>, LyricsFetchError> {
+        let response = self
+            .client
+            .get(UNISON_URL)
+            .query(&query)
+            .send()
+            .await
+            .map_err(provider_error("Unison"))?;
+        let Some(body) = response_body(response, "Unison").await? else {
+            return Ok(None);
+        };
+        let response: UnisonResponse = serde_json::from_slice(&body)
+            .map_err(|error| LyricsFetchError(format!("invalid Unison response: {error}")))?;
+        Ok(parse_unison(response))
+    }
 }
 
 impl Lyrics {
@@ -200,9 +253,22 @@ impl Lyrics {
         })
     }
 
+    pub fn footer_line_count(&self) -> usize {
+        2 + usize::from(!self.songwriters.is_empty())
+    }
+
     pub fn from_ttml(document: &str) -> Result<Self, TtmlError> {
         let document = roxmltree::Document::parse(document)
             .map_err(|error| TtmlError(format!("invalid TTML: {error}")))?;
+        let mut songwriters = Vec::new();
+        for songwriter in document.descendants().filter(|node| {
+            node.is_element() && node.tag_name().name().eq_ignore_ascii_case("songwriter")
+        }) {
+            let name = songwriter.text().unwrap_or_default().trim();
+            if !name.is_empty() && !songwriters.iter().any(|existing| existing == name) {
+                songwriters.push(name.to_owned());
+            }
+        }
         let body = document
             .descendants()
             .find(|node| node.is_element() && node.tag_name().name() == "body")
@@ -276,6 +342,7 @@ impl Lyrics {
             timing,
             lines,
             source: "TTML".to_owned(),
+            songwriters,
         })
     }
 }
@@ -303,6 +370,25 @@ struct BiniLyricsResult {
 struct LrcLibResponse {
     synced_lyrics: Option<String>,
     plain_lyrics: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UnisonResponse {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    data: Option<UnisonData>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnisonData {
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    sync_type: String,
+    #[serde(default)]
+    lyrics: String,
 }
 
 async fn response_body(
@@ -346,7 +432,12 @@ fn allowed_provider_url(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
         && matches!(
             url.host_str(),
-            Some("lyrics-api.binimum.org" | "lyrics-storage.binimum.org" | "lrclib.net")
+            Some(
+                "lyrics-api.binimum.org"
+                    | "lyrics-storage.binimum.org"
+                    | "lrclib.net"
+                    | "unison.boidu.dev"
+            )
         )
 }
 
@@ -428,6 +519,7 @@ fn parse_lrclib(response: LrcLibResponse) -> Option<Lyrics> {
             timing: LyricsTiming::LineSynced,
             lines,
             source: "LRCLIB".to_owned(),
+            songwriters: Vec::new(),
         });
     }
 
@@ -447,7 +539,76 @@ fn parse_lrclib(response: LrcLibResponse) -> Option<Lyrics> {
         timing: LyricsTiming::Plain,
         lines,
         source: "LRCLIB".to_owned(),
+        songwriters: Vec::new(),
     })
+}
+
+fn parse_unison(response: UnisonResponse) -> Option<Lyrics> {
+    if !response.success {
+        return None;
+    }
+    let data = response.data?;
+    match data.format.as_str() {
+        "ttml" => {
+            let lyrics = Lyrics::from_ttml(&data.lyrics).ok();
+            if let Some(mut lyrics) = lyrics {
+                lyrics.source = "Unison".to_owned();
+                return Some(lyrics);
+            }
+        }
+        "lrc" => {
+            if let Some(lines) = parse_lrc(&data.lyrics) {
+                return Some(Lyrics {
+                    timing: LyricsTiming::LineSynced,
+                    lines,
+                    source: "Unison".to_owned(),
+                    songwriters: Vec::new(),
+                });
+            }
+        }
+        _ => {
+            let timed = unison_sync_timing(&data.sync_type)
+                .is_some_and(|timing| timing > LyricsTiming::Plain);
+            if timed && let Some(lines) = parse_lrc(&data.lyrics) {
+                return Some(Lyrics {
+                    timing: LyricsTiming::LineSynced,
+                    lines,
+                    source: "Unison".to_owned(),
+                    songwriters: Vec::new(),
+                });
+            }
+            let lines = data
+                .lyrics
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|text| LyricLine {
+                    text: text.to_owned(),
+                    start_ms: None,
+                    end_ms: None,
+                    syllables: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                return Some(Lyrics {
+                    timing: LyricsTiming::Plain,
+                    lines,
+                    source: "Unison".to_owned(),
+                    songwriters: Vec::new(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn unison_sync_timing(sync_type: &str) -> Option<LyricsTiming> {
+    match sync_type {
+        "richsync" => Some(LyricsTiming::SyllableSynced),
+        "linesync" => Some(LyricsTiming::LineSynced),
+        "plain" => Some(LyricsTiming::Plain),
+        _ => None,
+    }
 }
 
 fn parse_lrc(document: &str) -> Option<Vec<LyricLine>> {
@@ -666,13 +827,15 @@ fn parse_number(value: &str, original: &str) -> Result<f64, TtmlError> {
 mod tests {
     use super::{
         BiniLyricsResult, LrcLibResponse, Lyrics, LyricsClient, LyricsTiming, LyricsTrack,
-        allowed_provider_url, best_bini_match, parse_lrclib,
+        UnisonData, UnisonResponse, allowed_provider_url, best_bini_match, parse_lrclib,
+        parse_unison, unison_sync_timing,
     };
 
     #[test]
     fn parses_syllable_synced_ttml() {
         let lyrics = Lyrics::from_ttml(
             r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+                <head><metadata><songwriters><songwriter>J. Tajor</songwriter><songwriter>J. Tajor</songwriter></songwriters></metadata></head>
                 <body>
                     <div>
                         <p begin="00:01.000" end="00:04.000">
@@ -695,6 +858,7 @@ mod tests {
         assert_eq!(lyrics.lines[0].syllables[0].start_ms, 1_000);
         assert_eq!(lyrics.lines[0].syllables[1].text, "lo");
         assert_eq!(lyrics.lines[0].syllables[1].tail, " ");
+        assert_eq!(lyrics.songwriters, ["J. Tajor"]);
     }
 
     #[test]
@@ -868,6 +1032,152 @@ mod tests {
         assert_eq!(lyrics.lines[1].text, "Second");
     }
 
+    #[test]
+    fn parses_unison_ttml_as_syllable_synced() {
+        let lyrics = parse_unison(UnisonResponse {
+            success: true,
+            data: Some(UnisonData {
+                format: "ttml".to_owned(),
+                sync_type: "richsync".to_owned(),
+                lyrics: r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><p begin="1s" end="3s"><span begin="1s" end="2s">Hello</span> <span begin="2s" end="3s">world</span></p></body></tt>"#
+                    .to_owned(),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(lyrics.source, "Unison");
+        assert_eq!(lyrics.lines[0].text, "Hello world");
+        assert_eq!(lyrics.lines[0].syllables.len(), 2);
+    }
+
+    #[test]
+    fn parses_unison_lrc_as_line_synced() {
+        let lyrics = parse_unison(UnisonResponse {
+            success: true,
+            data: Some(UnisonData {
+                format: "lrc".to_owned(),
+                sync_type: "linesync".to_owned(),
+                lyrics: "[00:01.25]First\n[00:03.500]Second".to_owned(),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::LineSynced);
+        assert_eq!(lyrics.source, "Unison");
+        assert_eq!(lyrics.lines[0].start_ms, Some(1_250));
+        assert_eq!(lyrics.lines[1].end_ms, Some(8_500));
+    }
+
+    #[test]
+    fn parses_unison_plain_text_fallback() {
+        let lyrics = parse_unison(UnisonResponse {
+            success: true,
+            data: Some(UnisonData {
+                format: "text".to_owned(),
+                sync_type: "plain".to_owned(),
+                lyrics: "First line\n\nSecond line".to_owned(),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::Plain);
+        assert_eq!(lyrics.source, "Unison");
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[1].text, "Second line");
+    }
+
+    #[test]
+    fn rejects_failed_unison_responses() {
+        assert!(
+            parse_unison(UnisonResponse {
+                success: false,
+                data: None,
+            })
+            .is_none()
+        );
+        assert!(
+            parse_unison(UnisonResponse {
+                success: true,
+                data: None,
+            })
+            .is_none()
+        );
+        assert!(
+            parse_unison(UnisonResponse {
+                success: true,
+                data: Some(UnisonData {
+                    format: "ttml".to_owned(),
+                    sync_type: "richsync".to_owned(),
+                    lyrics: "<not-ttml>".to_owned(),
+                }),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn maps_unison_sync_types_to_timing() {
+        assert_eq!(
+            unison_sync_timing("richsync"),
+            Some(LyricsTiming::SyllableSynced)
+        );
+        assert_eq!(
+            unison_sync_timing("linesync"),
+            Some(LyricsTiming::LineSynced)
+        );
+        assert_eq!(unison_sync_timing("plain"), Some(LyricsTiming::Plain));
+        assert_eq!(unison_sync_timing("unknown"), None);
+    }
+
+    #[test]
+    fn honors_unison_sync_type_for_untagged_lrc_payloads() {
+        let lyrics = parse_unison(UnisonResponse {
+            success: true,
+            data: Some(UnisonData {
+                format: "text".to_owned(),
+                sync_type: "linesync".to_owned(),
+                lyrics: "[00:01.25]First\n[00:03.500]Second".to_owned(),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::LineSynced);
+        assert_eq!(lyrics.source, "Unison");
+        assert_eq!(lyrics.lines[0].start_ms, Some(1_250));
+    }
+
+    #[test]
+    fn allows_unison_host_in_provider_validation() {
+        assert!(allowed_provider_url(
+            &reqwest::Url::parse("https://unison.boidu.dev/lyrics?v=abc123").unwrap()
+        ));
+        assert!(!allowed_provider_url(
+            &reqwest::Url::parse("https://unison.boidu.dev.attacker.example/lyrics").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
+    async fn loads_syllable_synced_lyrics_from_live_unison() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch_unison(&LyricsTrack {
+                title: "Tahanan".to_owned(),
+                artist: "El Manu".to_owned(),
+                album: Some("Tahanan".to_owned()),
+                duration_seconds: Some(196),
+                video_id: Some("XoBuaGgV80Y".to_owned()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(lyrics.source, "Unison");
+        assert!(!lyrics.lines.is_empty());
+    }
+
     #[tokio::test]
     #[ignore = "live lyrics provider compatibility probe"]
     async fn loads_syllable_synced_lyrics_from_live_providers() {
@@ -878,13 +1188,15 @@ mod tests {
                 artist: "Adie".to_owned(),
                 album: Some("Tahanan".to_owned()),
                 duration_seconds: Some(294),
+                video_id: None,
             })
             .await
             .unwrap()
             .unwrap();
 
         assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
-        assert_eq!(lyrics.source, "BiniLyrics");
+        assert_eq!(lyrics.source, "Apple (via BiniLyrics)");
+        assert_eq!(lyrics.songwriters, ["Adrian Garcia"]);
         assert!(!lyrics.lines.is_empty());
     }
 
@@ -895,6 +1207,7 @@ mod tests {
             artist: "Adie".to_owned(),
             album: None,
             duration_seconds: Some(294),
+            video_id: None,
         };
         let unrelated = BiniLyricsResult {
             track_name: "Different Song".to_owned(),

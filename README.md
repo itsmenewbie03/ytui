@@ -108,7 +108,7 @@ Open **Settings**, select **SponsorBlock** under **Playback**, and enable the se
 
 ### 🎤 Lyrics
 
-When a track starts, ytui searches [BiniLyrics](https://lyrics-api.binimum.org/) and [LRCLIB](https://lrclib.net/) using its title, artist, and any available album and duration metadata. YouTube account cookies are never sent to either service. The Lyrics tab prefers syllable-synced lyrics, then line-synced lyrics, and finally plain text; the selected source is shown above the lyrics.
+When a track starts, ytui searches [BiniLyrics](https://lyrics-api.binimum.org/), [Unison](https://unison.boidu.dev/), and [LRCLIB](https://lrclib.net/) using its title, artist, and any available album and duration metadata; Unison is also queried by the current YouTube video ID for exact matches. YouTube account cookies are never sent to these services. The Lyrics tab prefers syllable-synced lyrics, then line-synced lyrics, and finally plain text; songwriter and provider attribution appears after the lyrics when available.
 
 ### 🎶 Playlist Playback
 

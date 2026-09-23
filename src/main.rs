@@ -2,6 +2,7 @@ use color_eyre::Result;
 
 mod app;
 mod config;
+pub mod lyrics;
 pub mod player;
 pub mod scraper;
 mod spectrum;

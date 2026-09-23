@@ -8,6 +8,7 @@ use self::model::{
 };
 use self::mpris::{MprisCommand, MprisService, MprisSnapshot};
 use crate::config::{Config, Credentials, MiniPlayerLayout, SponsorBlockCategory};
+use crate::lyrics::{Lyrics, LyricsClient, LyricsFetchError, LyricsTrack};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
 use crate::scraper::ytmusic::{
     AccountIdentity, AudioStreamInfo, PlaylistPlayback, UpNextQueue, YTMusic, YTMusicHomeFeed,
@@ -61,6 +62,7 @@ type SearchRequestResult = innertube_rs::error::Result<YTMusicSearchResults>;
 type InitRequestResult = innertube_rs::error::Result<(YTMusic, Option<AccountIdentity>)>;
 type AuthRequestResult = innertube_rs::error::Result<(YTMusic, AccountIdentity, Credentials)>;
 type SponsorBlockRequestResult = (String, Vec<String>, Result<Vec<Segment>, String>);
+type LyricsRequestResult = (String, Result<Option<Lyrics>, LyricsFetchError>);
 
 #[derive(Clone, Copy)]
 struct AccentColor {
@@ -183,6 +185,12 @@ struct App {
     home_state: ListState,
     home_error: Option<String>,
     play_receiver: Option<Receiver<PlayRequestResult>>,
+    lyrics_client: Option<LyricsClient>,
+    lyrics_receiver: Option<Receiver<LyricsRequestResult>>,
+    lyrics: Option<Lyrics>,
+    lyrics_loading: bool,
+    lyrics_error: Option<String>,
+    lyrics_scroll: usize,
     up_next_receiver: Option<Receiver<UpNextRequestResult>>,
     up_next_mode: UpNextLoadMode,
     playlist_receiver: Option<Receiver<PlaylistRequestResult>>,
@@ -225,6 +233,12 @@ fn playback_track(track: crate::scraper::ytmusic::UpNextTrack) -> PlaybackTrack 
         views: None,
         likes: None,
     }
+}
+
+fn parse_track_duration(duration: &str) -> Option<u64> {
+    duration.split(':').try_fold(0_u64, |total, part| {
+        total.checked_mul(60)?.checked_add(part.parse().ok()?)
+    })
 }
 
 fn append_automix(queue: &mut Vec<PlaybackTrack>, automix: UpNextQueue) {
@@ -284,6 +298,12 @@ impl App {
             home_state: ListState::default(),
             home_error: None,
             play_receiver: None,
+            lyrics_client: LyricsClient::new().ok(),
+            lyrics_receiver: None,
+            lyrics: None,
+            lyrics_loading: false,
+            lyrics_error: None,
+            lyrics_scroll: 0,
             up_next_receiver: None,
             up_next_mode: UpNextLoadMode::Replace,
             playlist_receiver: None,
@@ -324,6 +344,7 @@ impl App {
             self.poll_home();
             self.poll_search();
             self.poll_play_request();
+            self.poll_lyrics();
             self.poll_sponsorblock();
             self.poll_playlist();
             self.poll_up_next();
@@ -400,8 +421,21 @@ impl App {
                         KeyCode::Up | KeyCode::Char('k') if self.player_tab == 1 => {
                             self.previous_up_next();
                         }
+                        KeyCode::Up | KeyCode::Char('k') if self.player_tab == 0 => {
+                            self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1);
+                        }
                         KeyCode::Down | KeyCode::Char('j') if self.player_tab == 1 => {
                             self.next_up_next();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if self.player_tab == 0 => {
+                            let last = self.lyrics.as_ref().map_or(0, |lyrics| {
+                                lyrics
+                                    .lines
+                                    .len()
+                                    .saturating_add(lyrics.footer_line_count())
+                                    .saturating_sub(1)
+                            });
+                            self.lyrics_scroll = (self.lyrics_scroll + 1).min(last);
                         }
                         KeyCode::Enter if self.player_tab == 1 => self.play_selected_up_next(),
                         KeyCode::Char(' ') => self.toggle_pause(),
@@ -827,6 +861,36 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 self.play_receiver = None;
                 self.playback_error("The playback task stopped unexpectedly.".to_owned());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn poll_lyrics(&mut self) {
+        let Some(receiver) = &self.lyrics_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((video_id, result)) => {
+                self.lyrics_receiver = None;
+                let current_video_id = self
+                    .playback
+                    .track
+                    .as_ref()
+                    .map(|track| track.video_id.as_str());
+                if !lyrics_response_matches(current_video_id, &video_id) {
+                    return;
+                }
+                self.lyrics_loading = false;
+                match result {
+                    Ok(lyrics) => self.lyrics = lyrics,
+                    Err(error) => self.lyrics_error = Some(error.to_string()),
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.lyrics_receiver = None;
+                self.lyrics_loading = false;
+                self.lyrics_error = Some("The lyrics task stopped unexpectedly.".to_owned());
             }
             Err(TryRecvError::Empty) => {}
         }
@@ -1413,6 +1477,7 @@ impl App {
         self.playback.watch_tracking = None;
         self.last_watch_report = None;
         let video_id = track.video_id.clone();
+        self.request_lyrics(&track);
         self.request_sponsorblock_segments(video_id.clone());
         let sync_history = self.config.watch_history && self.account_identity.is_some();
         let (sender, receiver) = mpsc::channel();
@@ -1465,6 +1530,34 @@ impl App {
         self.up_next_mode = mode;
         self.playback.queue_loading = true;
         self.playback.queue_error = None;
+    }
+
+    fn request_lyrics(&mut self, track: &PlaybackTrack) {
+        self.lyrics_receiver = None;
+        self.lyrics = None;
+        self.lyrics_error = None;
+        self.lyrics_scroll = 0;
+        let Some(client) = self.lyrics_client.clone() else {
+            self.lyrics_loading = false;
+            self.lyrics_error = Some("Could not initialize the lyrics client.".to_owned());
+            return;
+        };
+
+        let video_id = track.video_id.clone();
+        let lyrics_track = LyricsTrack {
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            duration_seconds: track.duration.as_deref().and_then(parse_track_duration),
+            video_id: Some(video_id.clone()),
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let result = client.fetch(lyrics_track).await;
+            let _ = sender.send((video_id, result));
+        });
+        self.lyrics_receiver = Some(receiver);
+        self.lyrics_loading = true;
     }
 
     fn toggle_pause(&mut self) {
@@ -1706,6 +1799,7 @@ impl App {
         if matches!(self.playback.status, PlaybackStatus::Stopped) {
             self.play_receiver = None;
             self.player = None;
+            self.request_lyrics(&track);
             self.playback.track = Some(track);
             self.playback.position = 0.0;
             self.playback.duration = 0.0;
@@ -1902,6 +1996,10 @@ fn sponsorblock_response_matches(
             .eq(requested.iter().map(String::as_str))
 }
 
+fn lyrics_response_matches(current_video_id: Option<&str>, response_video_id: &str) -> bool {
+    current_video_id == Some(response_video_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1958,6 +2056,13 @@ mod tests {
             "current",
             &requested,
         ));
+    }
+
+    #[test]
+    fn rejects_stale_lyrics_responses() {
+        assert!(!lyrics_response_matches(Some("current"), "previous"));
+        assert!(!lyrics_response_matches(None, "previous"));
+        assert!(lyrics_response_matches(Some("current"), "current"));
     }
 
     fn playback(video_id: &str) -> PlaybackTrack {

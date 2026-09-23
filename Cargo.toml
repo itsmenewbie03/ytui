@@ -13,7 +13,9 @@ color-eyre = "0.6.5"
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 mpris-server = { version = "0.10", features = ["tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 cpal = { version = "0.18.2", features = ["pipewire"] }
 ringbuf = "0.5.2"
 rustfft = "6"
+roxmltree = "0.20"
+unicode-segmentation = "1"

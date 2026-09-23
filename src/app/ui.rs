@@ -3,6 +3,7 @@ use super::{
 };
 use crate::app::model::{Focus, NotificationMode, PlaybackStatus, Screen};
 use crate::config::{MiniPlayerLayout, SponsorBlockCategory};
+use crate::lyrics::{LyricLine, Lyrics, LyricsTiming};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -12,9 +13,12 @@ use ratatui::{
         Block, BorderType, Borders, Clear, LineGauge, List, ListItem, Padding, Paragraph, Wrap,
     },
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 const COMPACT_MINI_PLAYER_WIDTH: u16 = 100;
 const MINIMAL_MINI_PLAYER_WIDTH: u16 = 56;
+const INSTRUMENTAL_GAP_MS: u64 = 2_000;
+const INTERLUDE_DOT: &str = "";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MiniPlayerMode {
@@ -872,13 +876,7 @@ impl App {
         let inner = block.inner(content);
         frame.render_widget(block, content);
         match self.player_tab {
-            0 => render_player_empty_state(
-                frame,
-                inner,
-                "Lyrics unavailable",
-                "Synced lyrics will appear here when support lands.",
-                accent,
-            ),
+            0 => self.render_lyrics(frame, inner),
             1 => self.render_up_next(frame, inner),
             2 => render_player_empty_state(
                 frame,
@@ -897,10 +895,16 @@ impl App {
             _ => unreachable!(),
         }
         frame.render_widget(
-            Paragraph::new(if self.player_tab == 1 {
-                " h/l or Tab: section  j/k: select  Enter: play  n/p: track  Esc/P: back  q: quit "
-            } else {
-                " h/l or Tab: section  Space: pause  [/] seek  n/p: track  Esc/P: back  q: quit "
+            Paragraph::new(match self.player_tab {
+                0 => {
+                    " h/l or Tab: section  j/k: scroll  Space: pause  [/] seek  Esc/P: back  q: quit "
+                }
+                1 => {
+                    " h/l or Tab: section  j/k: select  Enter: play  n/p: track  Esc/P: back  q: quit "
+                }
+                _ => {
+                    " h/l or Tab: section  Space: pause  [/] seek  n/p: track  Esc/P: back  q: quit "
+                }
             })
             .style(Style::default().fg(Color::DarkGray)),
             help,
@@ -1185,6 +1189,94 @@ impl App {
     fn spinner_frame(&self) -> &'static str {
         let frame = (self.animation_started.elapsed().as_millis() / 100) as usize;
         SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+    }
+
+    fn render_lyrics(&self, frame: &mut Frame, area: Rect) {
+        let accent = self.accent_color();
+        let highlight = complementary_highlight(accent);
+        if self.lyrics_loading {
+            render_player_empty_state(
+                frame,
+                area,
+                "Loading lyrics",
+                &format!("{}  Checking synchronized sources...", self.spinner_frame()),
+                accent,
+            );
+            return;
+        }
+        if let Some(error) = &self.lyrics_error {
+            render_player_empty_state(frame, area, "Lyrics unavailable", error, Color::Red);
+            return;
+        }
+        let Some(lyrics) = &self.lyrics else {
+            render_player_empty_state(
+                frame,
+                area,
+                "Lyrics unavailable",
+                "No matching lyrics were found for this track.",
+                accent,
+            );
+            return;
+        };
+
+        let body = area;
+        let position_ms = (self.playback.position.max(0.0) * 1_000.0) as u64;
+        let active = active_lyric_index(lyrics, position_ms);
+        let visible = usize::from(body.height.max(1));
+        let interlude = instrumental_interlude(lyrics, position_ms);
+        let interlude_index = interlude.map(|interlude| interlude.insert_before);
+        let lyric_display_len = lyrics.lines.len() + usize::from(interlude_index.is_some());
+        let footer = lyrics_footer_lines(lyrics);
+        let display_len = lyric_display_len + footer.len();
+        let anchor = interlude_index.or_else(|| {
+            active
+                .or_else(|| last_started_lyric_index(lyrics, position_ms))
+                .map(|index| display_index_for_lyric(index, interlude_index))
+        });
+        let start = anchor
+            .map(|index| {
+                index
+                    .saturating_sub(visible / 2)
+                    .min(display_len.saturating_sub(visible))
+            })
+            .unwrap_or(self.lyrics_scroll);
+        let take = if lyrics.timing == LyricsTiming::Plain {
+            display_len
+        } else {
+            visible
+        };
+        let lines = (start..display_len)
+            .take(take)
+            .filter_map(|display_index| {
+                if display_index >= lyric_display_len {
+                    return footer.get(display_index - lyric_display_len).cloned();
+                }
+                if interlude_index == Some(display_index) {
+                    let interlude = interlude.expect("interlude index requires interlude timing");
+                    return Some(render_instrumental_interlude(
+                        position_ms,
+                        interlude.start_ms,
+                        interlude.end_ms,
+                        highlight,
+                    ));
+                }
+                let lyric_index = lyric_index_for_display(display_index, interlude_index)?;
+                let line = lyrics.lines.get(lyric_index)?;
+                Some(render_lyric_line(
+                    line,
+                    Some(lyric_index) == active,
+                    position_ms,
+                    accent,
+                    highlight,
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .scroll((0, 0)),
+            body,
+        );
     }
 
     fn render_up_next(&mut self, frame: &mut Frame, area: Rect) {
@@ -1613,6 +1705,336 @@ impl App {
     }
 }
 
+fn active_lyric_index(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
+    if lyrics.timing == LyricsTiming::Plain {
+        return None;
+    }
+    lyrics.lines.iter().rposition(|line| {
+        line.start_ms
+            .is_some_and(|start_ms| start_ms <= position_ms)
+            && line.end_ms.is_none_or(|end_ms| position_ms < end_ms)
+    })
+}
+
+fn last_started_lyric_index(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
+    lyrics.lines.iter().rposition(|line| {
+        line.start_ms
+            .is_some_and(|start_ms| start_ms <= position_ms)
+    })
+}
+
+fn display_index_for_lyric(lyric_index: usize, interlude_index: Option<usize>) -> usize {
+    lyric_index + usize::from(interlude_index.is_some_and(|insert_at| lyric_index >= insert_at))
+}
+
+fn lyric_index_for_display(display_index: usize, interlude_index: Option<usize>) -> Option<usize> {
+    match interlude_index {
+        Some(insert_at) if display_index == insert_at => None,
+        Some(insert_at) if display_index > insert_at => Some(display_index - 1),
+        _ => Some(display_index),
+    }
+}
+
+fn lyrics_footer_lines(lyrics: &Lyrics) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(lyrics.footer_line_count());
+    lines.push(Line::default());
+    if !lyrics.songwriters.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Written by: ",
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                lyrics.songwriters.join(", "),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Lyrics Provided By: ",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(lyrics.source.clone(), Style::default().fg(Color::DarkGray)),
+    ]));
+    lines
+}
+
+fn render_lyric_line(
+    line: &LyricLine,
+    active: bool,
+    position_ms: u64,
+    accent: Color,
+    highlight: Color,
+) -> Line<'static> {
+    if active && !line.syllables.is_empty() {
+        return Line::from(
+            line.syllables
+                .iter()
+                .flat_map(|syllable| {
+                    if position_ms >= syllable.end_ms {
+                        return vec![
+                            Span::styled(
+                                syllable.text.clone(),
+                                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                syllable.tail.clone(),
+                                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                            ),
+                        ];
+                    }
+                    if position_ms < syllable.start_ms {
+                        return vec![
+                            Span::styled(syllable.text.clone(), Style::default().fg(Color::Gray)),
+                            Span::styled(syllable.tail.clone(), Style::default().fg(Color::Gray)),
+                        ];
+                    }
+
+                    let mut spans = render_syllable_wave(
+                        &syllable.text,
+                        position_ms,
+                        syllable.start_ms,
+                        syllable.end_ms,
+                        accent,
+                        highlight,
+                    );
+                    spans.push(Span::styled(
+                        syllable.tail.clone(),
+                        Style::default().fg(Color::Gray),
+                    ));
+                    spans
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    Line::styled(
+        line.text.clone(),
+        if active {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InstrumentalInterlude {
+    start_ms: u64,
+    end_ms: u64,
+    insert_before: usize,
+}
+
+fn instrumental_interlude(lyrics: &Lyrics, position_ms: u64) -> Option<InstrumentalInterlude> {
+    if lyrics.timing == LyricsTiming::Plain {
+        return None;
+    }
+    let first_start = lyrics.lines.first()?.start_ms?;
+    if first_start >= INSTRUMENTAL_GAP_MS && position_ms < first_start {
+        return Some(InstrumentalInterlude {
+            start_ms: 0,
+            end_ms: first_start,
+            insert_before: 0,
+        });
+    }
+
+    lyrics
+        .lines
+        .windows(2)
+        .enumerate()
+        .find_map(|(index, pair)| {
+            let start_ms = pair[0].end_ms?;
+            let end_ms = pair[1].start_ms?;
+            (end_ms.saturating_sub(start_ms) >= INSTRUMENTAL_GAP_MS
+                && (start_ms..end_ms).contains(&position_ms))
+            .then_some(InstrumentalInterlude {
+                start_ms,
+                end_ms,
+                insert_before: index + 1,
+            })
+        })
+}
+
+fn render_instrumental_interlude(
+    position_ms: u64,
+    start_ms: u64,
+    end_ms: u64,
+    highlight: Color,
+) -> Line<'static> {
+    let duration = end_ms.saturating_sub(start_ms).max(1);
+    let progress = position_ms.saturating_sub(start_ms) as f64 / duration as f64;
+    let dot_progress = progress.clamp(0.0, 1.0) * 3.0;
+    let target = color_rgb(highlight);
+    let mut spans = Vec::with_capacity(5);
+    for index in 0..3 {
+        let intensity = (dot_progress - index as f64).clamp(0.0, 1.0);
+        spans.push(Span::styled(
+            INTERLUDE_DOT,
+            Style::default()
+                .fg(interpolate_rgb((88, 91, 112), target, intensity))
+                .add_modifier(Modifier::BOLD),
+        ));
+        if index < 2 {
+            spans.push(Span::raw(" "));
+        }
+    }
+    Line::from(spans)
+}
+
+fn render_syllable_wave(
+    text: &str,
+    position_ms: u64,
+    start_ms: u64,
+    end_ms: u64,
+    accent: Color,
+    highlight: Color,
+) -> Vec<Span<'static>> {
+    let graphemes = UnicodeSegmentation::graphemes(text, true).collect::<Vec<_>>();
+    if graphemes.is_empty() {
+        return Vec::new();
+    }
+    let duration = end_ms.saturating_sub(start_ms).max(1);
+    let progress = position_ms.saturating_sub(start_ms) as f64 / duration as f64;
+    let completed_count = (progress.clamp(0.0, 1.0) * graphemes.len() as f64).round() as usize;
+    let mut spans = Vec::with_capacity(4);
+    if completed_count == 0 {
+        spans.push(Span::styled(
+            text.to_owned(),
+            Style::default().fg(Color::Gray),
+        ));
+        return spans;
+    }
+
+    let tip_index = completed_count.min(graphemes.len()) - 1;
+    let glow_index = tip_index.checked_sub(1);
+    let completed_end = glow_index.unwrap_or_default();
+    let completed = graphemes[..completed_end].concat();
+    let glow = glow_index.map(|index| graphemes[index].to_owned());
+    let tip = graphemes[tip_index].to_owned();
+    let remaining = graphemes[tip_index + 1..].concat();
+    if !completed.is_empty() {
+        spans.push(Span::styled(
+            completed,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(glow) = glow {
+        spans.push(Span::styled(
+            glow,
+            Style::default()
+                .fg(interpolate_rgb(
+                    color_rgb(accent),
+                    color_rgb(highlight),
+                    0.65,
+                ))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        tip,
+        Style::default().fg(highlight).add_modifier(Modifier::BOLD),
+    ));
+    if !remaining.is_empty() {
+        spans.push(Span::styled(remaining, Style::default().fg(Color::Gray)));
+    }
+    spans
+}
+
+fn complementary_highlight(accent: Color) -> Color {
+    let (red, green, blue) = color_rgb(accent);
+    let (hue, saturation, lightness) = rgb_to_hsl(red, green, blue);
+    let mut highlight = color_rgb(hsl_to_rgb(
+        (hue + 0.5) % 1.0,
+        saturation.max(0.45),
+        (lightness + 0.12).clamp(0.7, 0.9),
+    ));
+    let minimum_brightness = (perceived_brightness((red, green, blue)) + 8.0).min(252.0);
+    while perceived_brightness(highlight) <= minimum_brightness {
+        highlight = (
+            blend_channel_toward_white(highlight.0),
+            blend_channel_toward_white(highlight.1),
+            blend_channel_toward_white(highlight.2),
+        );
+    }
+    Color::Rgb(highlight.0, highlight.1, highlight.2)
+}
+
+fn blend_channel_toward_white(channel: u8) -> u8 {
+    let distance = 255_u16 - u16::from(channel);
+    u8::try_from(u16::from(channel) + (distance / 5).max(1)).unwrap_or(255)
+}
+
+fn perceived_brightness((red, green, blue): (u8, u8, u8)) -> f64 {
+    0.2126 * f64::from(red) + 0.7152 * f64::from(green) + 0.0722 * f64::from(blue)
+}
+
+fn rgb_to_hsl(red: u8, green: u8, blue: u8) -> (f64, f64, f64) {
+    let red = f64::from(red) / 255.0;
+    let green = f64::from(green) / 255.0;
+    let blue = f64::from(blue) / 255.0;
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    let delta = max - min;
+    let lightness = (max + min) / 2.0;
+    if delta == 0.0 {
+        return (0.5, 0.0, lightness);
+    }
+    let hue = if max == red {
+        ((green - blue) / delta).rem_euclid(6.0)
+    } else if max == green {
+        (blue - red) / delta + 2.0
+    } else {
+        (red - green) / delta + 4.0
+    } / 6.0;
+    let saturation = delta / (1.0 - (2.0 * lightness - 1.0).abs());
+    (hue, saturation, lightness)
+}
+
+fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Color {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let sector = hue * 6.0;
+    let x = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = match sector as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let offset = lightness - chroma / 2.0;
+    Color::Rgb(
+        ((red + offset) * 255.0).round() as u8,
+        ((green + offset) * 255.0).round() as u8,
+        ((blue + offset) * 255.0).round() as u8,
+    )
+}
+
+fn color_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(red, green, blue) => (red, green, blue),
+        _ => (255, 255, 255),
+    }
+}
+
+fn interpolate_rgb(from: (u8, u8, u8), to: (u8, u8, u8), amount: f64) -> Color {
+    let channel = |from: u8, to: u8| {
+        (f64::from(from) + (f64::from(to) - f64::from(from)) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
+    )
+}
+
 fn mini_player_mode(layout: MiniPlayerLayout, width: u16) -> MiniPlayerMode {
     if width < MINIMAL_MINI_PLAYER_WIDTH {
         MiniPlayerMode::Minimal
@@ -2021,5 +2443,166 @@ mod tests {
 
         assert_eq!(mode, MiniPlayerMode::Compact);
         assert_eq!(mini_player_height(mode), 3);
+    }
+
+    #[test]
+    fn selects_active_synced_line_from_absolute_position() {
+        let lyrics = Lyrics {
+            timing: LyricsTiming::LineSynced,
+            source: "test".to_owned(),
+            songwriters: Vec::new(),
+            lines: vec![
+                LyricLine {
+                    text: "First".to_owned(),
+                    start_ms: Some(1_000),
+                    end_ms: Some(2_000),
+                    syllables: Vec::new(),
+                },
+                LyricLine {
+                    text: "Second".to_owned(),
+                    start_ms: Some(3_000),
+                    end_ms: Some(4_000),
+                    syllables: Vec::new(),
+                },
+            ],
+        };
+
+        assert_eq!(active_lyric_index(&lyrics, 500), None);
+        assert_eq!(active_lyric_index(&lyrics, 1_500), Some(0));
+        assert_eq!(active_lyric_index(&lyrics, 2_500), None);
+        assert_eq!(active_lyric_index(&lyrics, 3_500), Some(1));
+        assert_eq!(active_lyric_index(&lyrics, 10_000), None);
+        assert_eq!(last_started_lyric_index(&lyrics, 2_500), Some(0));
+    }
+
+    #[test]
+    fn finds_leading_and_between_line_instrumentals() {
+        let lyrics = Lyrics {
+            timing: LyricsTiming::LineSynced,
+            source: "test".to_owned(),
+            songwriters: Vec::new(),
+            lines: vec![
+                LyricLine {
+                    text: "First".to_owned(),
+                    start_ms: Some(3_000),
+                    end_ms: Some(4_000),
+                    syllables: Vec::new(),
+                },
+                LyricLine {
+                    text: "Second".to_owned(),
+                    start_ms: Some(7_000),
+                    end_ms: Some(8_000),
+                    syllables: Vec::new(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            instrumental_interlude(&lyrics, 1_000),
+            Some(InstrumentalInterlude {
+                start_ms: 0,
+                end_ms: 3_000,
+                insert_before: 0,
+            })
+        );
+        assert_eq!(
+            instrumental_interlude(&lyrics, 5_000),
+            Some(InstrumentalInterlude {
+                start_ms: 4_000,
+                end_ms: 7_000,
+                insert_before: 1,
+            })
+        );
+        assert_eq!(instrumental_interlude(&lyrics, 3_500), None);
+    }
+
+    #[test]
+    fn inserts_interlude_before_upcoming_line_then_removes_it() {
+        let insert_at = Some(1);
+
+        assert_eq!(lyric_index_for_display(0, insert_at), Some(0));
+        assert_eq!(lyric_index_for_display(1, insert_at), None);
+        assert_eq!(lyric_index_for_display(2, insert_at), Some(1));
+        assert_eq!(display_index_for_lyric(1, insert_at), 2);
+        assert_eq!(lyric_index_for_display(1, None), Some(1));
+        assert_eq!(display_index_for_lyric(1, None), 1);
+    }
+
+    #[test]
+    fn appends_writer_and_provider_attribution_after_lyrics() {
+        let lyrics = Lyrics {
+            timing: LyricsTiming::Plain,
+            source: "Apple (via BiniLyrics)".to_owned(),
+            songwriters: vec!["J. Tajor".to_owned()],
+            lines: Vec::new(),
+        };
+        let footer = lyrics_footer_lines(&lyrics);
+        let text = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        assert_eq!(footer.len(), 3);
+        assert_eq!(text(&footer[0]), "");
+        assert_eq!(text(&footer[1]), "Written by: J. Tajor");
+        assert_eq!(
+            text(&footer[2]),
+            "Lyrics Provided By: Apple (via BiniLyrics)"
+        );
+    }
+
+    #[test]
+    fn uses_complementary_color_wave_without_underlining() {
+        let accent = Color::Rgb(203, 166, 247);
+        let highlight = complementary_highlight(accent);
+        let spans = render_syllable_wave("hello", 1_500, 1_000, 2_000, accent, highlight);
+
+        assert!(
+            perceived_brightness(color_rgb(highlight)) > perceived_brightness(color_rgb(accent))
+        );
+        assert!(spans.iter().any(|span| span.style.fg == Some(highlight)));
+        assert!(
+            spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
+    }
+
+    #[test]
+    fn complementary_highlights_are_brighter_for_every_theme() {
+        for accent in ACCENT_COLORS {
+            let color = accent.color();
+            assert!(
+                perceived_brightness(color_rgb(complementary_highlight(color)))
+                    > perceived_brightness(color_rgb(color)),
+                "{} highlight must be brighter",
+                accent.name
+            );
+        }
+    }
+
+    #[test]
+    fn wave_starts_unlit_and_preserves_grapheme_clusters() {
+        let accent = Color::Rgb(203, 166, 247);
+        let highlight = complementary_highlight(accent);
+        let start = render_syllable_wave("e\u{301}x", 1_000, 1_000, 2_000, accent, highlight);
+        let halfway = render_syllable_wave("e\u{301}x", 1_500, 1_000, 2_000, accent, highlight);
+
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0].style.fg, Some(Color::Gray));
+        assert_eq!(halfway[0].content.as_ref(), "e\u{301}");
+        assert_eq!(halfway[0].style.fg, Some(highlight));
+    }
+
+    #[test]
+    fn brightens_interlude_dots_as_time_advances() {
+        let highlight = Color::Rgb(244, 215, 250);
+        let early = render_instrumental_interlude(0, 0, 3_000, highlight);
+        let later = render_instrumental_interlude(2_000, 0, 3_000, highlight);
+
+        assert_ne!(early.spans[0].style.fg, later.spans[0].style.fg);
+        assert_eq!(later.spans[0].style.fg, Some(highlight));
     }
 }

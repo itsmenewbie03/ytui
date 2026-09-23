@@ -3,6 +3,7 @@ use super::{
 };
 use crate::app::model::{Focus, NotificationMode, PlaybackStatus, Screen};
 use crate::config::{MiniPlayerLayout, SponsorBlockCategory};
+use crate::lyrics::{LyricLine, Lyrics, LyricsTiming};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -872,13 +873,7 @@ impl App {
         let inner = block.inner(content);
         frame.render_widget(block, content);
         match self.player_tab {
-            0 => render_player_empty_state(
-                frame,
-                inner,
-                "Lyrics unavailable",
-                "Synced lyrics will appear here when support lands.",
-                accent,
-            ),
+            0 => self.render_lyrics(frame, inner),
             1 => self.render_up_next(frame, inner),
             2 => render_player_empty_state(
                 frame,
@@ -897,10 +892,16 @@ impl App {
             _ => unreachable!(),
         }
         frame.render_widget(
-            Paragraph::new(if self.player_tab == 1 {
-                " h/l or Tab: section  j/k: select  Enter: play  n/p: track  Esc/P: back  q: quit "
-            } else {
-                " h/l or Tab: section  Space: pause  [/] seek  n/p: track  Esc/P: back  q: quit "
+            Paragraph::new(match self.player_tab {
+                0 => {
+                    " h/l or Tab: section  j/k: scroll  Space: pause  [/] seek  Esc/P: back  q: quit "
+                }
+                1 => {
+                    " h/l or Tab: section  j/k: select  Enter: play  n/p: track  Esc/P: back  q: quit "
+                }
+                _ => {
+                    " h/l or Tab: section  Space: pause  [/] seek  n/p: track  Esc/P: back  q: quit "
+                }
             })
             .style(Style::default().fg(Color::DarkGray)),
             help,
@@ -1185,6 +1186,87 @@ impl App {
     fn spinner_frame(&self) -> &'static str {
         let frame = (self.animation_started.elapsed().as_millis() / 100) as usize;
         SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+    }
+
+    fn render_lyrics(&self, frame: &mut Frame, area: Rect) {
+        let accent = self.accent_color();
+        if self.lyrics_loading {
+            render_player_empty_state(
+                frame,
+                area,
+                "Loading lyrics",
+                &format!("{}  Checking synchronized sources...", self.spinner_frame()),
+                accent,
+            );
+            return;
+        }
+        if let Some(error) = &self.lyrics_error {
+            render_player_empty_state(frame, area, "Lyrics unavailable", error, Color::Red);
+            return;
+        }
+        let Some(lyrics) = &self.lyrics else {
+            render_player_empty_state(
+                frame,
+                area,
+                "Lyrics unavailable",
+                "No matching lyrics were found for this track.",
+                accent,
+            );
+            return;
+        };
+
+        let [source, body] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .areas(area);
+        let timing = match lyrics.timing {
+            LyricsTiming::SyllableSynced => "SYLLABLE SYNCED",
+            LyricsTiming::LineSynced => "LINE SYNCED",
+            LyricsTiming::Plain => "PLAIN",
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{timing}  ·  {}", lyrics.source))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+            source,
+        );
+
+        let position_ms = (self.playback.position.max(0.0) * 1_000.0) as u64;
+        let active = active_lyric_index(lyrics, position_ms);
+        let visible = usize::from(body.height.max(1));
+        let anchor = active.or_else(|| last_started_lyric_index(lyrics, position_ms));
+        let start = anchor
+            .map(|index| {
+                index
+                    .saturating_sub(visible / 2)
+                    .min(lyrics.lines.len().saturating_sub(visible))
+            })
+            .unwrap_or(self.lyrics_scroll);
+        let lines = lyrics
+            .lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(if lyrics.timing == LyricsTiming::Plain {
+                lyrics.lines.len()
+            } else {
+                visible
+            })
+            .map(|(index, line)| {
+                render_lyric_line(
+                    line,
+                    index == active.unwrap_or(usize::MAX),
+                    position_ms,
+                    accent,
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .scroll((0, 0)),
+            body,
+        );
     }
 
     fn render_up_next(&mut self, frame: &mut Frame, area: Rect) {
@@ -1613,6 +1695,63 @@ impl App {
     }
 }
 
+fn active_lyric_index(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
+    if lyrics.timing == LyricsTiming::Plain {
+        return None;
+    }
+    lyrics.lines.iter().rposition(|line| {
+        line.start_ms
+            .is_some_and(|start_ms| start_ms <= position_ms)
+            && line.end_ms.is_none_or(|end_ms| position_ms < end_ms)
+    })
+}
+
+fn last_started_lyric_index(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
+    lyrics.lines.iter().rposition(|line| {
+        line.start_ms
+            .is_some_and(|start_ms| start_ms <= position_ms)
+    })
+}
+
+fn render_lyric_line(
+    line: &LyricLine,
+    active: bool,
+    position_ms: u64,
+    accent: Color,
+) -> Line<'static> {
+    if active && !line.syllables.is_empty() {
+        return Line::from(
+            line.syllables
+                .iter()
+                .flat_map(|syllable| {
+                    let style = if position_ms >= syllable.end_ms {
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+                    } else if position_ms >= syllable.start_ms {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    [
+                        Span::styled(syllable.text.clone(), style),
+                        Span::styled(syllable.tail.clone(), style),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    Line::styled(
+        line.text.clone(),
+        if active {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    )
+}
+
 fn mini_player_mode(layout: MiniPlayerLayout, width: u16) -> MiniPlayerMode {
     if width < MINIMAL_MINI_PLAYER_WIDTH {
         MiniPlayerMode::Minimal
@@ -2021,5 +2160,34 @@ mod tests {
 
         assert_eq!(mode, MiniPlayerMode::Compact);
         assert_eq!(mini_player_height(mode), 3);
+    }
+
+    #[test]
+    fn selects_active_synced_line_from_absolute_position() {
+        let lyrics = Lyrics {
+            timing: LyricsTiming::LineSynced,
+            source: "test".to_owned(),
+            lines: vec![
+                LyricLine {
+                    text: "First".to_owned(),
+                    start_ms: Some(1_000),
+                    end_ms: Some(2_000),
+                    syllables: Vec::new(),
+                },
+                LyricLine {
+                    text: "Second".to_owned(),
+                    start_ms: Some(3_000),
+                    end_ms: Some(4_000),
+                    syllables: Vec::new(),
+                },
+            ],
+        };
+
+        assert_eq!(active_lyric_index(&lyrics, 500), None);
+        assert_eq!(active_lyric_index(&lyrics, 1_500), Some(0));
+        assert_eq!(active_lyric_index(&lyrics, 2_500), None);
+        assert_eq!(active_lyric_index(&lyrics, 3_500), Some(1));
+        assert_eq!(active_lyric_index(&lyrics, 10_000), None);
+        assert_eq!(last_started_lyric_index(&lyrics, 2_500), Some(0));
     }
 }

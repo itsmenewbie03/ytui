@@ -22,12 +22,12 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 - Navigate with Vim-style keys or arrow keys
 - Copy playback diagnostics with an available system clipboard tool
 - Automatically skip selected community-reported segments with SponsorBlock
+- Follow syllable-synced, line-synced, or plain lyrics in the full player
 
-The full player includes tabs for lyrics, the queue, comments, and related tracks. The queue is ready today; the other tabs are friendly placeholders for what comes next.
+The full player includes tabs for lyrics, the queue, comments, and related tracks. Lyrics and the queue are ready today; comments and related tracks are friendly placeholders for what comes next.
 
 ## 🗺️ Planned Features
 
-- **Synchronized lyrics:** populate the player Lyrics tab with lightweight line, word, and syllable timing inspired by [YouLy+](https://github.com/ibratabian17/YouLyPlus), including graceful fallback when detailed timing is unavailable.
 - **Mouse support:** enable clicking tabs, controls, navigation items, and tracks while preserving the keyboard-first workflow.
 
 ## ⚙️ Requirements
@@ -105,6 +105,10 @@ When signed in, open **Settings**, move to **Playback**, and toggle **Sync watch
 ### ⏭️ Optional SponsorBlock Skipping
 
 Open **Settings**, select **SponsorBlock** under **Playback**, and enable the segment categories you want ytui to skip automatically. Every category is off by default. When at least one category is enabled, playback sends the current YouTube video ID to the public [SponsorBlock](https://sponsor.ajay.app/) service; YouTube account cookies are never included.
+
+### 🎤 Lyrics
+
+When a track starts, ytui searches [BiniLyrics](https://lyrics-api.binimum.org/) and [LRCLIB](https://lrclib.net/) using its title, artist, and any available album and duration metadata. YouTube account cookies are never sent to either service. The Lyrics tab prefers syllable-synced lyrics, then line-synced lyrics, and finally plain text; the selected source is shown above the lyrics.
 
 ### 🎶 Playlist Playback
 

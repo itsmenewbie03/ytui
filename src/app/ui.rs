@@ -1,6 +1,8 @@
-use super::{ACCENT_COLORS, App, CookieInputKind, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES};
+use super::{
+    ACCENT_COLORS, App, CookieInputKind, NAV_ITEMS, PLAYER_TABS, SPINNER_FRAMES, SettingsPage,
+};
 use crate::app::model::{Focus, NotificationMode, PlaybackStatus, Screen};
-use crate::config::MiniPlayerLayout;
+use crate::config::{MiniPlayerLayout, SponsorBlockCategory};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -88,7 +90,11 @@ impl App {
         } else if self.is_search_list() {
             " j/k: select  Enter: play  /: search  Space: pause  P: player  Esc: navigation "
         } else if self.is_settings() {
-            " j/k: setting  h/l: change  Enter: import cookies.txt  c: paste cookie  d: remove  Esc: navigation "
+            if self.settings_page == SettingsPage::SponsorBlock {
+                " j/k: category  Space/Enter: toggle  h/Esc: settings "
+            } else {
+                " j/k: setting  h/l: change  Enter: select  c: paste cookie  d: remove  Esc: navigation "
+            }
         } else {
             " Space: pause  [/] seek  n/p: track  P: player  Esc: navigation "
         };
@@ -200,6 +206,10 @@ impl App {
     }
 
     fn render_settings(&mut self, frame: &mut Frame, area: Rect) {
+        if self.settings_page == SettingsPage::SponsorBlock {
+            self.render_sponsorblock_settings(frame, area);
+            return;
+        }
         let accent = self.accent_color();
         let is_focused = self.focus == Focus::Content;
         let appearance_focused = is_focused && self.settings_row == 0;
@@ -219,6 +229,10 @@ impl App {
             container_inner.width.saturating_sub(margin * 2),
             container_inner.height,
         );
+        if inner.height < 24 && self.settings_row >= 2 {
+            self.render_compact_playback_settings(frame, inner, accent, is_focused);
+            return;
+        }
         let header = "APPEARANCE ";
         let rule = "─".repeat(usize::from(inner.width).saturating_sub(header.chars().count()));
         frame.render_widget(
@@ -391,9 +405,10 @@ impl App {
         if playback_header_y >= inner.bottom() {
             return;
         }
-        let playback_focused = is_focused && matches!(self.settings_row, 2..=3);
-        let watch_history_focused = is_focused && self.settings_row == 2;
-        let mini_player_focused = is_focused && self.settings_row == 3;
+        let playback_focused = is_focused && matches!(self.settings_row, 2..=4);
+        let sponsorblock_focused = is_focused && self.settings_row == 2;
+        let watch_history_focused = is_focused && self.settings_row == 3;
+        let mini_player_focused = is_focused && self.settings_row == 4;
         let playback_header = "PLAYBACK ";
         let playback_rule =
             "─".repeat(usize::from(inner.width).saturating_sub(playback_header.chars().count()));
@@ -432,7 +447,36 @@ impl App {
         let playback_inner = playback_block.inner(playback_area);
         frame.render_widget(playback_block, playback_area);
 
+        let enabled_categories = self.config.sponsorblock.enabled_count();
         let mut playback_lines = vec![Line::from(vec![
+            Span::styled(
+                "› ",
+                Style::default().fg(if sponsorblock_focused {
+                    accent
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled(
+                "SponsorBlock",
+                Style::default()
+                    .fg(if sponsorblock_focused {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        playback_lines.push(Line::styled(
+            if enabled_categories == 0 {
+                "Off · [Enter] configure".to_owned()
+            } else {
+                format!("{enabled_categories} categories enabled · [Enter] configure")
+            },
+            Style::default().fg(Color::DarkGray),
+        ));
+        playback_lines.push(Line::from(vec![
             Span::styled(
                 if self.config.watch_history {
                     "● "
@@ -455,7 +499,7 @@ impl App {
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-        ])];
+        ]));
         if self.config.watch_history && self.account_identity.is_none() {
             playback_lines.push(Line::styled(
                 "Requires a signed-in account",
@@ -497,6 +541,126 @@ impl App {
         frame.render_widget(
             Paragraph::new(playback_lines).wrap(Wrap { trim: true }),
             playback_inner,
+        );
+    }
+
+    fn render_compact_playback_settings(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        accent: Color,
+        is_focused: bool,
+    ) {
+        let enabled_categories = self.config.sponsorblock.enabled_count();
+        let rows = [
+            (
+                "›",
+                "SponsorBlock",
+                if enabled_categories == 0 {
+                    "Off · [Enter] configure".to_owned()
+                } else {
+                    format!("{enabled_categories} categories enabled · [Enter] configure")
+                },
+            ),
+            (
+                if self.config.watch_history {
+                    "●"
+                } else {
+                    "○"
+                },
+                "Sync watch history",
+                "Report plays to YouTube Music. [←] [→] [Enter] toggle".to_owned(),
+            ),
+            (
+                if self.config.mini_player_layout == MiniPlayerLayout::Compact {
+                    "●"
+                } else {
+                    "○"
+                },
+                "Compact mini player",
+                "Always use the dense layout. [←] [→] [Enter] toggle".to_owned(),
+            ),
+        ];
+        let items = rows.into_iter().map(|(marker, label, detail)| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{marker} "), Style::default().fg(accent)),
+                    Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+                ]),
+                Line::styled(detail, Style::default().fg(Color::DarkGray)),
+            ])
+        });
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title(" PLAYBACK ")
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(accent))
+                    .padding(Padding::horizontal(2)),
+            )
+            .highlight_symbol("│ ")
+            .highlight_style(if is_focused {
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            });
+        let mut state = ratatui::widgets::ListState::default()
+            .with_selected(Some(self.settings_row.saturating_sub(2)));
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn render_sponsorblock_settings(&mut self, frame: &mut Frame, area: Rect) {
+        let accent = self.accent_color();
+        let container = Block::default()
+            .title(" Settings / SponsorBlock ")
+            .title_style(Style::default().add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent))
+            .padding(Padding::horizontal(2));
+        let inner = container.inner(area);
+        frame.render_widget(container, area);
+        let [description, categories, help] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(3),
+                Constraint::Length(2),
+            ])
+            .areas(inner);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    "Automatically skip community-reported video segments.",
+                    Style::default().fg(Color::Gray),
+                ),
+                Line::styled(
+                    "Enabled playback sends the YouTube video ID to SponsorBlock.",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+            .wrap(Wrap { trim: true }),
+            description,
+        );
+        let items = SponsorBlockCategory::ALL.map(|category| {
+            let marker = if self.config.sponsorblock.is_enabled(category) {
+                "[x] "
+            } else {
+                "[ ] "
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker, Style::default().fg(accent)),
+                Span::raw(category.label()),
+            ]))
+        });
+        let list = List::new(items)
+            .highlight_symbol("│ ")
+            .highlight_style(Style::default().fg(accent).add_modifier(Modifier::BOLD));
+        frame.render_stateful_widget(list, categories, &mut self.sponsorblock_state);
+        frame.render_widget(
+            Paragraph::new("[Space/Enter] toggle    [Esc] back")
+                .style(Style::default().fg(Color::DarkGray)),
+            help,
         );
     }
 

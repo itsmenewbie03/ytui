@@ -21,12 +21,12 @@ Like this project? **Leave a star**! ⭐⭐⭐⭐⭐
 - See playback progress, duration, views, and likes at a glance
 - Navigate with Vim-style keys or arrow keys
 - Copy playback diagnostics with an available system clipboard tool
+- Automatically skip selected community-reported segments with SponsorBlock
 
 The full player includes tabs for lyrics, the queue, comments, and related tracks. The queue is ready today; the other tabs are friendly placeholders for what comes next.
 
 ## 🗺️ Planned Features
 
-- **SponsorBlock integration:** optionally detect and skip sponsored or other non-music segments during playback using [SponsorBlock](https://sponsor.ajay.app/).
 - **Synchronized lyrics:** populate the player Lyrics tab with lightweight line, word, and syllable timing inspired by [YouLy+](https://github.com/ibratabian17/YouLyPlus), including graceful fallback when detailed timing is unavailable.
 - **Mouse support:** enable clicking tabs, controls, navigation items, and tracks while preserving the keyboard-first workflow.
 
@@ -102,6 +102,10 @@ Treat both files like passwords: the cookies grant access to your YouTube accoun
 
 When signed in, open **Settings**, move to **Playback**, and toggle **Sync watch history** (`h` / `l` / `Enter`) to report plays to your YouTube Music account. This keeps your watch history and personalized recommendations in sync. It is off by default, and playback otherwise remains anonymous.
 
+### ⏭️ Optional SponsorBlock Skipping
+
+Open **Settings**, select **SponsorBlock** under **Playback**, and enable the segment categories you want ytui to skip automatically. Every category is off by default. When at least one category is enabled, playback sends the current YouTube video ID to the public [SponsorBlock](https://sponsor.ajay.app/) service; YouTube account cookies are never included.
+
 ### 🎶 Playlist Playback
 
 Selecting a playlist starts it from its first track, exactly like YouTube Music Web. Playlists are read-only: ytui loads the full track list (including paginated playlists), plays tracks in order, and shows the remaining tracks in the Up Next queue. When the playlist's final track ends, an Automix seeded from that last track keeps the music going.
@@ -122,7 +126,7 @@ Playlists can be opened from a **Home** shelf or a **Search** result. Mix cards 
 | `P` | Open or close the full player |
 | `q` | Quit |
 
-In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to import `cookies.txt`, `c` to paste a raw cookie header, and `d` to remove a saved account cookie. In the **Playback** section, `h` / `l` / `Enter` toggle watch history sync and the compact mini-player layout. The standard mini player also collapses automatically when the terminal becomes narrow.
+In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` to open the selected option, `c` to paste a raw cookie header, and `d` to remove a saved account cookie. In the **Playback** section, `h` / `l` / `Enter` toggle watch history sync and the compact mini-player layout. Inside SponsorBlock settings, use `j` / `k` to select a category and `Space` / `Enter` to toggle it. The standard mini player also collapses automatically when the terminal becomes narrow.
 
 ### 🎵 Playback
 

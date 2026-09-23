@@ -7,12 +7,13 @@ use self::model::{
     Screen, SearchItem, home_shelves, search_items,
 };
 use self::mpris::{MprisCommand, MprisService, MprisSnapshot};
-use crate::config::{Config, Credentials, MiniPlayerLayout};
+use crate::config::{Config, Credentials, MiniPlayerLayout, SponsorBlockCategory};
 use crate::player::{MpvPlayer, PlayerEvent, copy_to_clipboard};
 use crate::scraper::ytmusic::{
     AccountIdentity, AudioStreamInfo, PlaylistPlayback, UpNextQueue, YTMusic, YTMusicHomeFeed,
     YTMusicSearchResults,
 };
+use crate::sponsorblock::{Segment, SponsorBlockClient, skip_target};
 use color_eyre::eyre::{Context, Result};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
@@ -29,7 +30,14 @@ const NAV_ITEMS: [&str; 3] = ["Home", "Search", "Settings"];
 const PLAYER_TABS: [&str; 4] = ["Lyrics", "Up Next", "Comments", "Related"];
 const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const WATCH_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+const AUTO_SKIP_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTO_SKIP_REPEAT_GUARD: Duration = Duration::from_secs(2);
 const DEFAULT_ACCENT: usize = 10;
+const SETTINGS_ACCENT_ROW: usize = 0;
+const SETTINGS_ACCOUNT_ROW: usize = 1;
+const SETTINGS_SPONSORBLOCK_ROW: usize = 2;
+const SETTINGS_WATCH_HISTORY_ROW: usize = 3;
+const SETTINGS_MINI_PLAYER_ROW: usize = 4;
 const ACCENT_COLORS: [AccentColor; 14] = [
     AccentColor::new("Rosewater", 0xf5, 0xe0, 0xdc),
     AccentColor::new("Flamingo", 0xf2, 0xcd, 0xcd),
@@ -52,6 +60,7 @@ type PlaylistRequestResult = innertube_rs::error::Result<PlaylistPlayback>;
 type SearchRequestResult = innertube_rs::error::Result<YTMusicSearchResults>;
 type InitRequestResult = innertube_rs::error::Result<(YTMusic, Option<AccountIdentity>)>;
 type AuthRequestResult = innertube_rs::error::Result<(YTMusic, AccountIdentity, Credentials)>;
+type SponsorBlockRequestResult = (String, Vec<String>, Result<Vec<Segment>, String>);
 
 #[derive(Clone, Copy)]
 struct AccentColor {
@@ -80,6 +89,17 @@ impl AccentColor {
 enum CookieInputKind {
     NetscapeFile,
     Header,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Overview,
+    SponsorBlock,
+}
+
+struct AutoSkipAttempt {
+    target: f64,
+    started_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +131,7 @@ pub fn run() -> Result<()> {
         .flatten()
         .collect::<Vec<_>>()
         .join("; ");
+    let sponsorblock = SponsorBlockClient::new().ok();
     let mut app = App::new(
         runtime,
         mpris,
@@ -118,6 +139,7 @@ pub fn run() -> Result<()> {
         config,
         has_credentials,
         (!warning.is_empty()).then_some(warning),
+        sponsorblock,
     );
     execute!(std::io::stdout(), EnableBracketedPaste)?;
     let run_result = ratatui::run(|terminal| app.run(terminal));
@@ -180,6 +202,14 @@ struct App {
     search_receiver: Option<Receiver<SearchRequestResult>>,
     settings_state: ListState,
     settings_row: usize,
+    settings_page: SettingsPage,
+    sponsorblock_state: ListState,
+    sponsorblock: Option<SponsorBlockClient>,
+    sponsorblock_receiver: Option<Receiver<SponsorBlockRequestResult>>,
+    sponsorblock_video_id: Option<String>,
+    sponsorblock_segments: Vec<Segment>,
+    pending_auto_skip: Option<AutoSkipAttempt>,
+    recent_auto_skip: Option<AutoSkipAttempt>,
     animation_started: Instant,
     last_watch_report: Option<Instant>,
 }
@@ -215,6 +245,7 @@ impl App {
         config: Config,
         has_credentials: bool,
         config_warning: Option<String>,
+        sponsorblock: Option<SponsorBlockClient>,
     ) -> Self {
         let mut nav = ListState::default();
         nav.select(Some(0));
@@ -227,6 +258,8 @@ impl App {
         }
         let mut settings_state = ListState::default();
         settings_state.select(Some(accent_index.unwrap_or(DEFAULT_ACCENT)));
+        let mut sponsorblock_state = ListState::default();
+        sponsorblock_state.select(Some(0));
 
         Self {
             nav,
@@ -271,6 +304,14 @@ impl App {
             search_receiver: None,
             settings_state,
             settings_row: 0,
+            settings_page: SettingsPage::Overview,
+            sponsorblock_state,
+            sponsorblock,
+            sponsorblock_receiver: None,
+            sponsorblock_video_id: None,
+            sponsorblock_segments: Vec::new(),
+            pending_auto_skip: None,
+            recent_auto_skip: None,
             animation_started: Instant::now(),
             last_watch_report: None,
         }
@@ -283,9 +324,11 @@ impl App {
             self.poll_home();
             self.poll_search();
             self.poll_play_request();
+            self.poll_sponsorblock();
             self.poll_playlist();
             self.poll_up_next();
             self.poll_player_events();
+            self.expire_auto_skip_attempt();
             self.poll_watch_report();
             if self.poll_mpris_commands() {
                 self.finalize_watch_report();
@@ -370,6 +413,32 @@ impl App {
                     }
                 } else if key.code == KeyCode::Char('P') {
                     self.screen = Screen::Player;
+                } else if self.focus == Focus::Content
+                    && self.is_settings()
+                    && self.settings_page == SettingsPage::SponsorBlock
+                {
+                    match key.code {
+                        KeyCode::Char('q') => self.quit_confirmation = true,
+                        KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                            self.settings_page = SettingsPage::Overview;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let selected = self.sponsorblock_state.selected().unwrap_or_default();
+                            self.sponsorblock_state
+                                .select(Some(selected.saturating_sub(1)));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let selected = self.sponsorblock_state.selected().unwrap_or_default();
+                            self.sponsorblock_state.select(Some(
+                                (selected + 1).min(SponsorBlockCategory::ALL.len() - 1),
+                            ));
+                        }
+                        KeyCode::Enter
+                        | KeyCode::Char(' ')
+                        | KeyCode::Right
+                        | KeyCode::Char('l') => self.toggle_sponsorblock_category(),
+                        _ => {}
+                    }
                 } else if key.code == KeyCode::Char(' ') {
                     self.toggle_pause();
                 } else if key.code == KeyCode::Char('[') {
@@ -395,30 +464,38 @@ impl App {
                             self.next_home_shelf();
                         }
                         KeyCode::Left | KeyCode::Char('h') if self.is_settings() => {
-                            if self.settings_row == 0 {
+                            if self.settings_row == SETTINGS_ACCENT_ROW {
                                 self.previous_accent();
-                            } else if self.settings_row == 2 {
+                            } else if self.settings_row == SETTINGS_WATCH_HISTORY_ROW {
                                 self.toggle_watch_history();
-                            } else if self.settings_row == 3 {
+                            } else if self.settings_row == SETTINGS_MINI_PLAYER_ROW {
                                 self.toggle_mini_player_layout();
                             } else {
                                 self.focus = Focus::Nav;
                             }
                         }
                         KeyCode::Right | KeyCode::Char('l')
-                            if self.is_settings() && self.settings_row == 0 =>
+                            if self.is_settings() && self.settings_row == SETTINGS_ACCENT_ROW =>
                         {
                             self.next_accent();
                         }
                         KeyCode::Right | KeyCode::Char('l')
-                            if self.is_settings() && self.settings_row == 2 =>
+                            if self.is_settings()
+                                && self.settings_row == SETTINGS_WATCH_HISTORY_ROW =>
                         {
                             self.toggle_watch_history();
                         }
                         KeyCode::Right | KeyCode::Char('l')
-                            if self.is_settings() && self.settings_row == 3 =>
+                            if self.is_settings()
+                                && self.settings_row == SETTINGS_MINI_PLAYER_ROW =>
                         {
                             self.toggle_mini_player_layout();
+                        }
+                        KeyCode::Right | KeyCode::Char('l')
+                            if self.is_settings()
+                                && self.settings_row == SETTINGS_SPONSORBLOCK_ROW =>
+                        {
+                            self.settings_page = SettingsPage::SponsorBlock;
                         }
                         KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Nav,
                         KeyCode::Up | KeyCode::Char('k') if self.is_home_list() => {
@@ -437,23 +514,42 @@ impl App {
                             self.next_search();
                         }
                         KeyCode::Down | KeyCode::Char('j') if self.is_settings() => {
-                            self.settings_row = (self.settings_row + 1).min(3);
+                            self.settings_row =
+                                (self.settings_row + 1).min(SETTINGS_MINI_PLAYER_ROW);
                         }
                         KeyCode::Enter if self.is_home_list() => self.select_home_item(),
                         KeyCode::Enter if self.is_search_list() => self.select_search_item(),
-                        KeyCode::Enter if self.is_settings() && self.settings_row == 1 => {
+                        KeyCode::Enter
+                            if self.is_settings() && self.settings_row == SETTINGS_ACCOUNT_ROW =>
+                        {
                             self.open_cookie_input(CookieInputKind::NetscapeFile);
                         }
-                        KeyCode::Enter if self.is_settings() && self.settings_row == 2 => {
+                        KeyCode::Enter
+                            if self.is_settings()
+                                && self.settings_row == SETTINGS_WATCH_HISTORY_ROW =>
+                        {
                             self.toggle_watch_history();
                         }
-                        KeyCode::Enter if self.is_settings() && self.settings_row == 3 => {
+                        KeyCode::Enter
+                            if self.is_settings()
+                                && self.settings_row == SETTINGS_MINI_PLAYER_ROW =>
+                        {
                             self.toggle_mini_player_layout();
                         }
-                        KeyCode::Char('c') if self.is_settings() && self.settings_row == 1 => {
+                        KeyCode::Enter
+                            if self.is_settings()
+                                && self.settings_row == SETTINGS_SPONSORBLOCK_ROW =>
+                        {
+                            self.settings_page = SettingsPage::SponsorBlock;
+                        }
+                        KeyCode::Char('c')
+                            if self.is_settings() && self.settings_row == SETTINGS_ACCOUNT_ROW =>
+                        {
                             self.open_cookie_input(CookieInputKind::Header);
                         }
-                        KeyCode::Char('d') if self.is_settings() && self.settings_row == 1 => {
+                        KeyCode::Char('d')
+                            if self.is_settings() && self.settings_row == SETTINGS_ACCOUNT_ROW =>
+                        {
                             self.remove_cookie();
                         }
                         _ => {}
@@ -736,6 +832,41 @@ impl App {
         }
     }
 
+    fn poll_sponsorblock(&mut self) {
+        let Some(receiver) = &self.sponsorblock_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((video_id, categories, result)) => {
+                self.sponsorblock_receiver = None;
+                let current_video_id = self
+                    .playback
+                    .track
+                    .as_ref()
+                    .map(|track| track.video_id.as_str());
+                let enabled = self.config.sponsorblock.enabled_categories();
+                if !sponsorblock_response_matches(
+                    current_video_id,
+                    &enabled,
+                    &video_id,
+                    &categories,
+                ) {
+                    return;
+                }
+                match result {
+                    Ok(segments) => {
+                        self.sponsorblock_video_id = Some(video_id);
+                        self.sponsorblock_segments = segments;
+                        self.maybe_auto_skip(self.playback.position);
+                    }
+                    Err(error) => self.append_playback_diagnostic(error),
+                }
+            }
+            Err(TryRecvError::Disconnected) => self.sponsorblock_receiver = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     fn poll_playlist(&mut self) {
         let Some(receiver) = &self.playlist_receiver else {
             return;
@@ -878,12 +1009,19 @@ impl App {
                     if matches!(self.playback.status, PlaybackStatus::Loading) {
                         self.mark_playing();
                     }
+                    if !self.update_pending_auto_skip(position) {
+                        self.maybe_auto_skip(position);
+                    }
                 }
                 PlayerEvent::Seeked(position) => {
                     self.playback.position = position;
                     self.mpris.seeked(position);
+                    self.update_pending_auto_skip(position);
                 }
-                PlayerEvent::Duration(duration) => self.playback.duration = duration,
+                PlayerEvent::Duration(duration) => {
+                    self.playback.duration = duration;
+                    self.maybe_auto_skip(self.playback.position);
+                }
                 PlayerEvent::Paused(paused) => {
                     if self
                         .pending_pause
@@ -1044,6 +1182,16 @@ impl App {
             "Mini player",
             format!("Using the {layout} layout."),
         ));
+    }
+
+    fn toggle_sponsorblock_category(&mut self) {
+        let index = self.sponsorblock_state.selected().unwrap_or_default();
+        let category = SponsorBlockCategory::ALL[index];
+        self.config.sponsorblock.toggle(category);
+        if let Err(error) = self.config.save() {
+            self.notification = Some(Notification::warning("Config not saved", error));
+        }
+        self.refresh_sponsorblock_segments();
     }
 
     fn open_cookie_input(&mut self, kind: CookieInputKind) {
@@ -1265,6 +1413,7 @@ impl App {
         self.playback.watch_tracking = None;
         self.last_watch_report = None;
         let video_id = track.video_id.clone();
+        self.request_sponsorblock_segments(video_id.clone());
         let sync_history = self.config.watch_history && self.account_identity.is_some();
         let (sender, receiver) = mpsc::channel();
         let stream_video_id = video_id.clone();
@@ -1374,11 +1523,13 @@ impl App {
         self.pause_on_load = false;
         self.pending_pause = None;
         self.player = None;
+        self.clear_sponsorblock_state();
         self.playback.status = PlaybackStatus::Stopped;
         self.playback.position = 0.0;
     }
 
     fn seek(&mut self, seconds: f64) {
+        self.pending_auto_skip = None;
         let Some(player) = self.player.as_mut() else {
             return;
         };
@@ -1388,11 +1539,127 @@ impl App {
     }
 
     fn seek_absolute(&mut self, seconds: f64) {
+        self.pending_auto_skip = None;
         let Some(player) = self.player.as_mut() else {
             return;
         };
         if let Err(error) = player.seek_absolute(seconds) {
             self.playback_error(format!("Could not seek: {error}"));
+        }
+    }
+
+    fn refresh_sponsorblock_segments(&mut self) {
+        let video_id = self
+            .playback
+            .track
+            .as_ref()
+            .filter(|_| {
+                !matches!(
+                    self.playback.status,
+                    PlaybackStatus::Idle | PlaybackStatus::Stopped | PlaybackStatus::Error
+                )
+            })
+            .map(|track| track.video_id.clone());
+        if let Some(video_id) = video_id {
+            self.request_sponsorblock_segments(video_id);
+        } else {
+            self.clear_sponsorblock_state();
+        }
+    }
+
+    fn request_sponsorblock_segments(&mut self, video_id: String) {
+        self.clear_sponsorblock_state();
+        let categories = self
+            .config
+            .sponsorblock
+            .enabled_categories()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if categories.is_empty() {
+            return;
+        }
+        let Some(client) = self.sponsorblock.clone() else {
+            self.append_playback_diagnostic("SponsorBlock client is unavailable.".to_owned());
+            return;
+        };
+        let request_video_id = video_id.clone();
+        let request_categories = categories.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let result = client
+                .fetch_segments(&request_video_id, &request_categories)
+                .await;
+            let _ = sender.send((request_video_id, request_categories, result));
+        });
+        self.sponsorblock_receiver = Some(receiver);
+    }
+
+    fn clear_sponsorblock_state(&mut self) {
+        self.sponsorblock_receiver = None;
+        self.sponsorblock_video_id = None;
+        self.sponsorblock_segments.clear();
+        self.pending_auto_skip = None;
+        self.recent_auto_skip = None;
+    }
+
+    fn maybe_auto_skip(&mut self, position: f64) {
+        if self
+            .pending_auto_skip
+            .as_ref()
+            .is_some_and(|attempt| attempt.started_at.elapsed() < AUTO_SKIP_TIMEOUT)
+            || self.sponsorblock_video_id.as_deref()
+                != self
+                    .playback
+                    .track
+                    .as_ref()
+                    .map(|track| track.video_id.as_str())
+        {
+            return;
+        }
+        self.pending_auto_skip = None;
+        let enabled = self.config.sponsorblock.enabled_categories();
+        let Some(mut target) = skip_target(position, &self.sponsorblock_segments, &enabled) else {
+            return;
+        };
+        if self.playback.duration <= 0.0 || target > self.playback.duration + 0.5 {
+            return;
+        }
+        target = target.min(self.playback.duration);
+        if self.recent_auto_skip.as_ref().is_some_and(|attempt| {
+            attempt.target == target && attempt.started_at.elapsed() < AUTO_SKIP_REPEAT_GUARD
+        }) {
+            return;
+        }
+        let Some(player) = self.player.as_mut() else {
+            return;
+        };
+        let started_at = Instant::now();
+        self.pending_auto_skip = Some(AutoSkipAttempt { target, started_at });
+        self.recent_auto_skip = Some(AutoSkipAttempt { target, started_at });
+        if let Err(error) = player.seek_absolute(target) {
+            self.pending_auto_skip = None;
+            self.append_playback_diagnostic(format!("SponsorBlock skip failed: {error}"));
+        }
+    }
+
+    fn update_pending_auto_skip(&mut self, position: f64) -> bool {
+        let Some(attempt) = &self.pending_auto_skip else {
+            return false;
+        };
+        if position >= attempt.target || attempt.started_at.elapsed() >= AUTO_SKIP_TIMEOUT {
+            self.pending_auto_skip = None;
+        }
+        true
+    }
+
+    fn expire_auto_skip_attempt(&mut self) {
+        if self
+            .pending_auto_skip
+            .as_ref()
+            .is_some_and(|attempt| attempt.started_at.elapsed() >= AUTO_SKIP_TIMEOUT)
+        {
+            self.pending_auto_skip = None;
         }
     }
 
@@ -1622,6 +1889,19 @@ impl App {
     }
 }
 
+fn sponsorblock_response_matches(
+    current_video_id: Option<&str>,
+    enabled: &[&str],
+    response_video_id: &str,
+    requested: &[String],
+) -> bool {
+    current_video_id == Some(response_video_id)
+        && enabled
+            .iter()
+            .copied()
+            .eq(requested.iter().map(String::as_str))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1654,6 +1934,30 @@ mod tests {
                 "automix-second"
             ]
         );
+    }
+
+    #[test]
+    fn rejects_stale_sponsorblock_responses() {
+        let requested = vec!["sponsor".to_owned()];
+
+        assert!(!sponsorblock_response_matches(
+            Some("current"),
+            &["sponsor"],
+            "previous",
+            &requested,
+        ));
+        assert!(!sponsorblock_response_matches(
+            Some("current"),
+            &["sponsor", "intro"],
+            "current",
+            &requested,
+        ));
+        assert!(sponsorblock_response_matches(
+            Some("current"),
+            &["sponsor"],
+            "current",
+            &requested,
+        ));
     }
 
     fn playback(video_id: &str) -> PlaybackTrack {

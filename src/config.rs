@@ -19,12 +19,128 @@ pub enum MiniPlayerLayout {
     Compact,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SponsorBlockCategory {
+    Sponsor,
+    SelfPromotion,
+    ExclusiveAccess,
+    Interaction,
+    Intro,
+    Outro,
+    Preview,
+    MusicOfftopic,
+    Filler,
+}
+
+impl SponsorBlockCategory {
+    pub const ALL: [Self; 9] = [
+        Self::Sponsor,
+        Self::SelfPromotion,
+        Self::ExclusiveAccess,
+        Self::Interaction,
+        Self::Intro,
+        Self::Outro,
+        Self::Preview,
+        Self::MusicOfftopic,
+        Self::Filler,
+    ];
+
+    pub const fn api_name(self) -> &'static str {
+        match self {
+            Self::Sponsor => "sponsor",
+            Self::SelfPromotion => "selfpromo",
+            Self::ExclusiveAccess => "exclusive_access",
+            Self::Interaction => "interaction",
+            Self::Intro => "intro",
+            Self::Outro => "outro",
+            Self::Preview => "preview",
+            Self::MusicOfftopic => "music_offtopic",
+            Self::Filler => "filler",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sponsor => "Sponsor",
+            Self::SelfPromotion => "Unpaid / Self Promotion",
+            Self::ExclusiveAccess => "Exclusive Access",
+            Self::Interaction => "Interaction Reminder (Subscribe)",
+            Self::Intro => "Intermission / Intro Animation",
+            Self::Outro => "Endcards / Credits",
+            Self::Preview => "Preview / Recap",
+            Self::MusicOfftopic => "Music: Non-Music Section",
+            Self::Filler => "Tangent / Jokes",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default)]
+pub struct SponsorBlockConfig {
+    pub sponsor: bool,
+    pub self_promotion: bool,
+    pub exclusive_access: bool,
+    pub interaction: bool,
+    pub intro: bool,
+    pub outro: bool,
+    pub preview: bool,
+    pub music_offtopic: bool,
+    pub filler: bool,
+}
+
+impl SponsorBlockConfig {
+    pub fn is_enabled(&self, category: SponsorBlockCategory) -> bool {
+        match category {
+            SponsorBlockCategory::Sponsor => self.sponsor,
+            SponsorBlockCategory::SelfPromotion => self.self_promotion,
+            SponsorBlockCategory::ExclusiveAccess => self.exclusive_access,
+            SponsorBlockCategory::Interaction => self.interaction,
+            SponsorBlockCategory::Intro => self.intro,
+            SponsorBlockCategory::Outro => self.outro,
+            SponsorBlockCategory::Preview => self.preview,
+            SponsorBlockCategory::MusicOfftopic => self.music_offtopic,
+            SponsorBlockCategory::Filler => self.filler,
+        }
+    }
+
+    pub fn toggle(&mut self, category: SponsorBlockCategory) {
+        let enabled = match category {
+            SponsorBlockCategory::Sponsor => &mut self.sponsor,
+            SponsorBlockCategory::SelfPromotion => &mut self.self_promotion,
+            SponsorBlockCategory::ExclusiveAccess => &mut self.exclusive_access,
+            SponsorBlockCategory::Interaction => &mut self.interaction,
+            SponsorBlockCategory::Intro => &mut self.intro,
+            SponsorBlockCategory::Outro => &mut self.outro,
+            SponsorBlockCategory::Preview => &mut self.preview,
+            SponsorBlockCategory::MusicOfftopic => &mut self.music_offtopic,
+            SponsorBlockCategory::Filler => &mut self.filler,
+        };
+        *enabled = !*enabled;
+    }
+
+    pub fn enabled_categories(&self) -> Vec<&'static str> {
+        SponsorBlockCategory::ALL
+            .into_iter()
+            .filter(|category| self.is_enabled(*category))
+            .map(SponsorBlockCategory::api_name)
+            .collect()
+    }
+
+    pub fn enabled_count(&self) -> usize {
+        SponsorBlockCategory::ALL
+            .into_iter()
+            .filter(|category| self.is_enabled(*category))
+            .count()
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub accent: String,
     pub watch_history: bool,
     pub mini_player_layout: MiniPlayerLayout,
+    pub sponsorblock: SponsorBlockConfig,
 }
 
 impl Default for Config {
@@ -33,6 +149,7 @@ impl Default for Config {
             accent: DEFAULT_ACCENT.to_owned(),
             watch_history: false,
             mini_player_layout: MiniPlayerLayout::Standard,
+            sponsorblock: SponsorBlockConfig::default(),
         }
     }
 }
@@ -292,6 +409,34 @@ mod tests {
         assert_eq!(config.accent, DEFAULT_ACCENT);
         assert!(!config.watch_history, "watch history should be opt-in");
         assert_eq!(config.mini_player_layout, MiniPlayerLayout::Standard);
+        assert_eq!(config.sponsorblock, SponsorBlockConfig::default());
+    }
+
+    #[test]
+    fn partial_sponsorblock_settings_use_defaults() {
+        let config = toml::from_str::<Config>("[sponsorblock]\nsponsor = true")
+            .expect("partial SponsorBlock settings should parse");
+
+        assert!(config.sponsorblock.sponsor);
+        assert!(!config.sponsorblock.intro);
+        assert_eq!(config.sponsorblock.enabled_categories(), ["sponsor"]);
+    }
+
+    #[test]
+    fn serializes_stable_sponsorblock_field_names() {
+        let mut config = Config::default();
+        config
+            .sponsorblock
+            .toggle(SponsorBlockCategory::SelfPromotion);
+        config
+            .sponsorblock
+            .toggle(SponsorBlockCategory::MusicOfftopic);
+
+        let serialized = toml::to_string(&config).expect("config should serialize");
+
+        assert!(serialized.contains("[sponsorblock]"));
+        assert!(serialized.contains("self_promotion = true"));
+        assert!(serialized.contains("music_offtopic = true"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod config;
 pub mod player;
 pub mod scraper;
 mod spectrum;
+mod sponsorblock;
 
 fn main() -> Result<()> {
     color_eyre::install()?;

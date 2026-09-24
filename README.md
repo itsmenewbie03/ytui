@@ -48,6 +48,22 @@ On Linux desktops, ytui automatically publishes playback metadata and controls o
 
 ## 🛠️ Setup
 
+### ⚡ Quick Install
+
+Install a prebuilt Linux binary in one line (installs to `~/.local/bin`):
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/itsmenewbie03/ytui/main/install.sh | bash
+```
+
+The installer downloads the latest release from GitHub, verifies its checksum, and adds a PATH hint if needed. Pass a version tag to install a specific release, or a `--prefix` to pick the destination:
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/itsmenewbie03/ytui/main/install.sh | bash -s v0.1.0 --prefix ~/bin
+```
+
+### 🔨 Building from Source
+
 Clone the repository and enter the project directory:
 
 ```shell

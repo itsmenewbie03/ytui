@@ -17,7 +17,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const COMPACT_MINI_PLAYER_WIDTH: u16 = 100;
 const MINIMAL_MINI_PLAYER_WIDTH: u16 = 56;
-const INSTRUMENTAL_GAP_MS: u64 = 2_000;
+const INSTRUMENTAL_GAP_MS: u64 = 7_000;
+const INTERLUDE_START_DELAY_MS: u64 = 310;
+const INTERLUDE_END_LEAD_MS: u64 = 660;
 const INTERLUDE_DOT: &str = "";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1836,9 +1838,13 @@ fn instrumental_interlude(lyrics: &Lyrics, position_ms: u64) -> Option<Instrumen
     }
     let first_start = lyrics.lines.first()?.start_ms?;
     if first_start >= INSTRUMENTAL_GAP_MS && position_ms < first_start {
+        let end_ms = first_start.saturating_sub(INTERLUDE_END_LEAD_MS);
+        if position_ms >= end_ms {
+            return None;
+        }
         return Some(InstrumentalInterlude {
             start_ms: 0,
-            end_ms: first_start,
+            end_ms,
             insert_before: 0,
         });
     }
@@ -1848,9 +1854,11 @@ fn instrumental_interlude(lyrics: &Lyrics, position_ms: u64) -> Option<Instrumen
         .windows(2)
         .enumerate()
         .find_map(|(index, pair)| {
-            let start_ms = pair[0].end_ms?;
-            let end_ms = pair[1].start_ms?;
-            (end_ms.saturating_sub(start_ms) >= INSTRUMENTAL_GAP_MS
+            let previous_end_ms = pair[0].end_ms?;
+            let next_start_ms = pair[1].start_ms?;
+            let start_ms = previous_end_ms.saturating_add(INTERLUDE_START_DELAY_MS);
+            let end_ms = next_start_ms.saturating_sub(INTERLUDE_END_LEAD_MS);
+            (next_start_ms.saturating_sub(previous_end_ms) >= INSTRUMENTAL_GAP_MS
                 && (start_ms..end_ms).contains(&position_ms))
             .then_some(InstrumentalInterlude {
                 start_ms,
@@ -2484,14 +2492,14 @@ mod tests {
             lines: vec![
                 LyricLine {
                     text: "First".to_owned(),
-                    start_ms: Some(3_000),
-                    end_ms: Some(4_000),
+                    start_ms: Some(8_000),
+                    end_ms: Some(9_000),
                     syllables: Vec::new(),
                 },
                 LyricLine {
                     text: "Second".to_owned(),
-                    start_ms: Some(7_000),
-                    end_ms: Some(8_000),
+                    start_ms: Some(17_000),
+                    end_ms: Some(18_000),
                     syllables: Vec::new(),
                 },
             ],
@@ -2501,19 +2509,21 @@ mod tests {
             instrumental_interlude(&lyrics, 1_000),
             Some(InstrumentalInterlude {
                 start_ms: 0,
-                end_ms: 3_000,
+                end_ms: 7_340,
                 insert_before: 0,
             })
         );
         assert_eq!(
-            instrumental_interlude(&lyrics, 5_000),
+            instrumental_interlude(&lyrics, 10_000),
             Some(InstrumentalInterlude {
-                start_ms: 4_000,
-                end_ms: 7_000,
+                start_ms: 9_310,
+                end_ms: 16_340,
                 insert_before: 1,
             })
         );
-        assert_eq!(instrumental_interlude(&lyrics, 3_500), None);
+        assert_eq!(instrumental_interlude(&lyrics, 7_500), None);
+        assert_eq!(instrumental_interlude(&lyrics, 9_200), None);
+        assert_eq!(instrumental_interlude(&lyrics, 16_500), None);
     }
 
     #[test]

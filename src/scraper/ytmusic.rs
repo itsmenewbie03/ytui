@@ -277,22 +277,29 @@ impl YTMusic {
         video_id: &str,
         sync_history: bool,
     ) -> innertube_rs::error::Result<AudioStreamInfo> {
-        let options = GetVideoInfoOptions {
-            client: Some(if sync_history {
-                "YTMUSIC".to_owned()
-            } else {
-                "VISIONOS".to_owned()
-            }),
+        let stream_options = GetVideoInfoOptions {
+            client: Some("VISIONOS".to_owned()),
             ..Default::default()
         };
-        let playback = if sync_history {
-            &self.yt
-        } else {
-            &self.playback
+        let tracking_options = GetVideoInfoOptions {
+            client: Some("YTMUSIC".to_owned()),
+            ..Default::default()
         };
-        let info_request = playback.get_basic_info(video_id, Some(&options));
+        let info_request = self
+            .playback
+            .get_basic_info(video_id, Some(&stream_options));
+        let tracking_request = async {
+            if !sync_history {
+                return None;
+            }
+            self.yt
+                .get_basic_info(video_id, Some(&tracking_options))
+                .await
+                .ok()
+                .and_then(|info| extract_tracking(&info))
+        };
         let likes_request = self.get_like_count(video_id);
-        let (info, likes) = tokio::join!(info_request, likes_request);
+        let (info, tracking, likes) = tokio::join!(info_request, tracking_request, likes_request);
         let info = info?;
         let views = info
             .player_response
@@ -306,13 +313,8 @@ impl YTMusic {
                 quality: QualityPreference::Highest,
                 container: None,
             },
-            &playback.player.decipherer,
+            &self.playback.player.decipherer,
         )?;
-        let tracking = if sync_history {
-            extract_tracking(&info)
-        } else {
-            None
-        };
         Ok(AudioStreamInfo {
             url,
             views,

@@ -4,6 +4,7 @@ use std::{error::Error, fmt, time::Duration};
 
 const BINILYRICS_SEARCH_URL: &str = "https://lyrics-api.binimum.org/getLyrics";
 const BINILYRICS_STORAGE_HOST: &str = "lyrics-storage.binimum.org";
+const LRC_RED_HOST: &str = "lrc.red";
 const LRCLIB_URL: &str = "https://lrclib.net/api/get";
 const UNISON_URL: &str = "https://unison.boidu.dev/lyrics";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -147,7 +148,11 @@ impl LyricsClient {
         };
         let lyrics_url = reqwest::Url::parse(&result.lyrics_url)
             .map_err(|error| LyricsFetchError(format!("invalid BiniLyrics URL: {error}")))?;
-        if lyrics_url.scheme() != "https" || lyrics_url.host_str() != Some(BINILYRICS_STORAGE_HOST)
+        if lyrics_url.scheme() != "https"
+            || !matches!(
+                lyrics_url.host_str(),
+                Some(BINILYRICS_STORAGE_HOST | LRC_RED_HOST)
+            )
         {
             return Err(LyricsFetchError(
                 "BiniLyrics returned an unsupported lyrics URL".to_owned(),
@@ -435,6 +440,7 @@ fn allowed_provider_url(url: &reqwest::Url) -> bool {
             Some(
                 "lyrics-api.binimum.org"
                     | "lyrics-storage.binimum.org"
+                    | "lrc.red"
                     | "lrclib.net"
                     | "unison.boidu.dev"
             )
@@ -1180,14 +1186,14 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live lyrics provider compatibility probe"]
-    async fn loads_syllable_synced_lyrics_from_live_providers() {
+    async fn loads_syllable_synced_lyrics_from_live_binilyrics() {
         let lyrics = LyricsClient::new()
             .unwrap()
-            .fetch(LyricsTrack {
-                title: "Tahanan".to_owned(),
-                artist: "Adie".to_owned(),
-                album: Some("Tahanan".to_owned()),
-                duration_seconds: Some(294),
+            .fetch_binilyrics(&LyricsTrack {
+                title: "Marilag".to_owned(),
+                artist: "Dionela".to_owned(),
+                album: Some("Marilag - Single".to_owned()),
+                duration_seconds: Some(158),
                 video_id: None,
             })
             .await
@@ -1196,7 +1202,7 @@ mod tests {
 
         assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
         assert_eq!(lyrics.source, "Apple (via BiniLyrics)");
-        assert_eq!(lyrics.songwriters, ["Adrian Garcia"]);
+        assert_eq!(lyrics.songwriters, ["Dionela"]);
         assert!(!lyrics.lines.is_empty());
     }
 
@@ -1220,6 +1226,12 @@ mod tests {
         assert!(!allowed_provider_url(
             &reqwest::Url::parse("https://lyrics-storage.binimum.org.attacker.example/a.ttml")
                 .unwrap()
+        ));
+        assert!(allowed_provider_url(
+            &reqwest::Url::parse("https://lrc.red/s/PHUM72400160.ttml").unwrap()
+        ));
+        assert!(!allowed_provider_url(
+            &reqwest::Url::parse("https://lrc.red.attacker.example/s/PHUM72400160.ttml").unwrap()
         ));
     }
 }

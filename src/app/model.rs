@@ -148,6 +148,48 @@ pub(super) struct PlaybackState {
     pub(super) watch_tracking: Option<WatchTracking>,
     pub(super) spectrum: [f32; SPECTRUM_BANDS],
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueShift {
+    Up,
+    Down,
+}
+
+impl PlaybackState {
+    /// Reports whether `index` is a song the listener has not reached yet.
+    pub(super) fn is_upcoming(&self, index: usize) -> bool {
+        self.queue_index
+            .is_some_and(|current| index > current && index < self.queue.len())
+    }
+
+    /// Places the upcoming song at `index` directly after the current one, keeping every other
+    /// song in its existing relative order.
+    pub(super) fn play_next(&mut self, index: usize) -> Option<PlaybackTrack> {
+        let current = self.queue_index?;
+        if !self.is_upcoming(index) || index == current + 1 {
+            return None;
+        }
+        let track = self.queue.remove(index);
+        self.queue.insert(current + 1, track.clone());
+        Some(track)
+    }
+
+    /// Moves the upcoming song at `index` one slot toward the current song or toward the end of
+    /// the queue and reports the position it now holds.
+    pub(super) fn shift_upcoming(&mut self, index: usize, shift: QueueShift) -> Option<usize> {
+        let current = self.queue_index?;
+        if !self.is_upcoming(index) {
+            return None;
+        }
+        let target = match shift {
+            QueueShift::Up if index > current + 1 => index - 1,
+            QueueShift::Down if index + 1 < self.queue.len() => index + 1,
+            _ => return None,
+        };
+        self.queue.swap(index, target);
+        Some(target)
+    }
+}
 #[derive(Default)]
 pub(super) enum PlaybackStatus {
     #[default]
@@ -429,6 +471,97 @@ mod tests {
     }
 
     #[test]
+    fn plays_next_upcoming_song_without_reordering_others() {
+        let mut playback = PlaybackState {
+            queue: vec![
+                playback("played"),
+                playback("current"),
+                playback("third"),
+                playback("fourth"),
+            ],
+            queue_index: Some(1),
+            ..PlaybackState::default()
+        };
+
+        let moved = playback.play_next(3);
+
+        assert_eq!(moved.map(|track| track.video_id), Some("fourth".to_owned()));
+        assert_eq!(
+            queue_ids(&playback),
+            ["played", "current", "fourth", "third"]
+        );
+        assert_eq!(playback.queue_index, Some(1));
+    }
+
+    #[test]
+    fn refuses_to_play_next_a_song_that_is_not_upcoming() {
+        let mut playback = PlaybackState {
+            queue: vec![playback("played"), playback("current"), playback("next")],
+            queue_index: Some(1),
+            ..PlaybackState::default()
+        };
+
+        assert_eq!(playback.play_next(0).map(|track| track.video_id), None);
+        assert_eq!(playback.play_next(1).map(|track| track.video_id), None);
+        assert_eq!(playback.play_next(2).map(|track| track.video_id), None);
+        assert_eq!(queue_ids(&playback), ["played", "current", "next"]);
+    }
+
+    #[test]
+    fn shifts_an_upcoming_song_within_the_upcoming_songs() {
+        let mut playback = queue_at_current(1);
+
+        assert_eq!(playback.shift_upcoming(3, QueueShift::Up), Some(2));
+        assert_eq!(
+            queue_ids(&playback),
+            ["played", "current", "fourth", "third"]
+        );
+
+        assert_eq!(playback.shift_upcoming(2, QueueShift::Down), Some(3));
+        assert_eq!(
+            queue_ids(&playback),
+            ["played", "current", "third", "fourth"]
+        );
+    }
+
+    #[test]
+    fn keeps_upcoming_shifts_inside_the_queue_bounds() {
+        let mut playback = queue_at_current(1);
+
+        assert_eq!(playback.shift_upcoming(2, QueueShift::Up), None);
+        assert_eq!(playback.shift_upcoming(3, QueueShift::Down), None);
+        assert_eq!(
+            queue_ids(&playback),
+            ["played", "current", "third", "fourth"]
+        );
+    }
+
+    #[test]
+    fn refuses_to_shift_a_song_the_listener_already_heard() {
+        let mut playback = queue_at_current(1);
+
+        assert_eq!(playback.shift_upcoming(0, QueueShift::Down), None);
+        assert_eq!(playback.shift_upcoming(1, QueueShift::Down), None);
+        assert_eq!(
+            queue_ids(&playback),
+            ["played", "current", "third", "fourth"]
+        );
+    }
+
+    fn queue_at_current(index: usize) -> PlaybackState {
+        PlaybackState {
+            queue: vec![
+                playback("played"),
+                playback("current"),
+                playback("third"),
+                playback("fourth"),
+            ],
+            queue_index: Some(index),
+            ..PlaybackState::default()
+        }
+    }
+
+    #[test]
     fn puts_top_search_result_first_without_duplicates() {
         let results = YTMusicSearchResults {
             top_result: Some(MusicSearchTopResult {
@@ -462,5 +595,26 @@ mod tests {
         assert_eq!(items[0].title, "Ganda Mo");
         assert_eq!(items[0].video_id.as_deref(), Some("top-video"));
         assert_eq!(items[1].title, "Other result");
+    }
+
+    fn queue_ids(playback: &PlaybackState) -> Vec<&str> {
+        playback
+            .queue
+            .iter()
+            .map(|track| track.video_id.as_str())
+            .collect()
+    }
+
+    fn playback(video_id: &str) -> PlaybackTrack {
+        PlaybackTrack {
+            video_id: video_id.to_owned(),
+            title: video_id.to_owned(),
+            artist: "Artist".to_owned(),
+            album: None,
+            art_url: None,
+            duration: None,
+            views: None,
+            likes: None,
+        }
     }
 }

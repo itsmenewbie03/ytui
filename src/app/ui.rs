@@ -102,7 +102,7 @@ impl App {
                 " j/k: setting  h/l: change  Enter: select  c: paste cookie  d: remove  Esc: navigation "
             }
         } else {
-            " Space: pause  [/] seek  n/p: track  P: player  Esc: navigation "
+            " Space: pause  [/] seek  n/p: track  c: copy link  P: player  Esc: navigation "
         };
         frame.render_widget(
             Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray)),
@@ -897,15 +897,18 @@ impl App {
             _ => unreachable!(),
         }
         frame.render_widget(
-            Paragraph::new(match self.player_tab {
-                0 => {
-                    " h/l or Tab: section  j/k: scroll  Space: pause  [/] seek  Esc/P: back  q: quit "
+            Paragraph::new(match (self.player_tab, self.up_next_move) {
+                (0, _) => {
+                    " h/l or Tab: section  j/k: scroll  Space: pause  [/] seek  c: copy link  Esc/P: back  q: quit "
                 }
-                1 => {
-                    " h/l or Tab: section  j/k: select  Enter: play  n/p: track  Esc/P: back  q: quit "
+                (1, true) => {
+                    " MOVE MODE  j/k: move  v, Enter, or Esc: keep  h/l or Tab: section  q: quit "
+                }
+                (1, false) => {
+                    " h/l or Tab: section  j/k: select  Enter: play  v: move  N: play next  c: copy link  Esc/P: back  q: quit "
                 }
                 _ => {
-                    " h/l or Tab: section  Space: pause  [/] seek  n/p: track  Esc/P: back  q: quit "
+                    " h/l or Tab: section  Space: pause  [/] seek  c: copy link  n/p: track  Esc/P: back  q: quit "
                 }
             })
             .style(Style::default().fg(Color::DarkGray)),
@@ -1061,7 +1064,7 @@ impl App {
         );
         self.render_player_timestamps(frame, timestamps);
         frame.render_widget(
-            Paragraph::new("[ / ] seek  ·  Space pause  ·  n / p skip")
+            Paragraph::new("[ / ] seek  ·  Space pause  ·  n / p skip  ·  c copy link")
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::DarkGray)),
             hint,
@@ -1291,7 +1294,9 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .areas(area);
-        let status_text = if self.playback.queue_loading {
+        let status_text = if self.up_next_move {
+            "MOVE MODE  ·  j/k: move  v, Enter, or Esc: keep this order".to_owned()
+        } else if self.playback.queue_loading {
             format!("{}  Building Automix...", self.spinner_frame())
         } else if let Some(error) = &self.playback.queue_error {
             error.clone()
@@ -1302,6 +1307,8 @@ impl App {
             Paragraph::new(status_text).style(Style::default().fg(
                 if self.playback.queue_error.is_some() {
                     Color::Red
+                } else if self.up_next_move {
+                    accent
                 } else {
                     Color::DarkGray
                 },

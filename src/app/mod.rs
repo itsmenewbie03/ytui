@@ -4,7 +4,7 @@ mod ui;
 
 use self::model::{
     Focus, HomeEntry, HomeShelf, Notification, PlaybackState, PlaybackStatus, PlaybackTrack,
-    Screen, SearchItem, home_shelves, search_items,
+    QueueShift, Screen, SearchItem, home_shelves, search_items,
 };
 use self::mpris::{MprisCommand, MprisService, MprisSnapshot};
 use crate::config::{Config, Credentials, MiniPlayerLayout, SponsorBlockCategory};
@@ -195,6 +195,7 @@ struct App {
     up_next_mode: UpNextLoadMode,
     playlist_receiver: Option<Receiver<PlaylistRequestResult>>,
     up_next_state: ListState,
+    up_next_move: bool,
     pause_on_load: bool,
     pending_pause: Option<bool>,
     player: Option<MpvPlayer>,
@@ -239,6 +240,10 @@ fn parse_track_duration(duration: &str) -> Option<u64> {
     duration.split(':').try_fold(0_u64, |total, part| {
         total.checked_mul(60)?.checked_add(part.parse().ok()?)
     })
+}
+
+fn watch_url(video_id: &str) -> String {
+    format!("https://www.youtube.com/watch?v={video_id}")
 }
 
 fn append_automix(queue: &mut Vec<PlaybackTrack>, automix: UpNextQueue) {
@@ -308,6 +313,7 @@ impl App {
             up_next_mode: UpNextLoadMode::Replace,
             playlist_receiver: None,
             up_next_state: ListState::default(),
+            up_next_move: false,
             pause_on_load: false,
             pending_pause: None,
             player: None,
@@ -409,9 +415,19 @@ impl App {
                         _ => {}
                     }
                 } else if self.screen == Screen::Player {
+                    if self.up_next_move
+                        && self.player_tab == 1
+                        && self.handle_up_next_move_key(key.code)
+                    {
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') => self.quit_confirmation = true,
-                        KeyCode::Esc | KeyCode::Char('P') => self.screen = Screen::Main,
+                        KeyCode::Esc | KeyCode::Char('P') => {
+                            self.screen = Screen::Main;
+                            self.up_next_move = false;
+                        }
+                        KeyCode::Char('c') => self.copy_current_track_url(),
                         KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
                             self.previous_player_tab();
                         }
@@ -438,6 +454,10 @@ impl App {
                             self.lyrics_scroll = (self.lyrics_scroll + 1).min(last);
                         }
                         KeyCode::Enter if self.player_tab == 1 => self.play_selected_up_next(),
+                        KeyCode::Char('v') if self.player_tab == 1 => {
+                            self.toggle_up_next_move_mode();
+                        }
+                        KeyCode::Char('N') if self.player_tab == 1 => self.play_next_upcoming(),
                         KeyCode::Char(' ') => self.toggle_pause(),
                         KeyCode::Char('[') => self.seek(-10.0),
                         KeyCode::Char(']') => self.seek(10.0),
@@ -483,6 +503,10 @@ impl App {
                     self.next_track();
                 } else if key.code == KeyCode::Char('p') {
                     self.previous_track();
+                } else if key.code == KeyCode::Char('c')
+                    && !(self.focus == Focus::Content && self.is_settings())
+                {
+                    self.copy_current_track_url();
                 } else if key.code == KeyCode::Char('/') {
                     self.nav.select(Some(1));
                     self.focus = Focus::Content;
@@ -1038,6 +1062,7 @@ impl App {
                     }
                 }
                 self.up_next_state.select(self.playback.queue_index);
+                self.up_next_move = false;
             }
             Ok(Err(error)) => {
                 self.up_next_receiver = None;
@@ -1470,6 +1495,7 @@ impl App {
             return;
         };
         self.playlist_receiver = None;
+        self.up_next_move = false;
         self.send_final_watch_report();
         self.player = None;
         self.pause_on_load = start_paused;
@@ -1840,6 +1866,120 @@ impl App {
         }
     }
 
+    fn copy_current_track_url(&mut self) {
+        let Some(track) = self.playback.track.as_ref() else {
+            self.notification = Some(Notification::warning(
+                "Nothing playing",
+                "Start a song before copying its link.",
+            ));
+            return;
+        };
+        let url = watch_url(&track.video_id);
+        self.notification = Some(match copy_to_clipboard(&url) {
+            Ok(()) => Notification::success("Link copied", url),
+            Err(error) => Notification::error("Could not copy link", error.to_string()),
+        });
+    }
+
+    fn upcoming_selection(&self) -> Option<usize> {
+        let index = self.up_next_state.selected()?;
+        self.playback.is_upcoming(index).then_some(index)
+    }
+
+    fn notify_queue_busy(&mut self) {
+        self.notification = Some(Notification::warning(
+            "Queue rebuilding",
+            "Wait for the queue to finish loading.",
+        ));
+    }
+
+    fn play_next_upcoming(&mut self) {
+        if self.playback.queue_loading {
+            self.notify_queue_busy();
+            return;
+        }
+        let Some(current) = self.playback.queue_index else {
+            self.notify_no_upcoming_song();
+            return;
+        };
+        let Some(index) = self.upcoming_selection() else {
+            self.notify_no_upcoming_song();
+            return;
+        };
+        if index == current + 1 {
+            self.notification = Some(Notification::info("Queue", "That song is already up next."));
+            return;
+        }
+        let Some(track) = self.playback.play_next(index) else {
+            return;
+        };
+        self.up_next_state.select(Some(current + 1));
+        self.notification = Some(Notification::info(
+            "Queue",
+            format!("{} plays next", track.title),
+        ));
+    }
+
+    fn notify_no_upcoming_song(&mut self) {
+        self.notification = Some(Notification::warning(
+            "No upcoming song",
+            "Select a song below the playing one in Up Next.",
+        ));
+    }
+
+    fn toggle_up_next_move_mode(&mut self) {
+        if self.up_next_move {
+            self.leave_up_next_move_mode();
+            return;
+        }
+        if self.playback.queue_loading {
+            self.notify_queue_busy();
+            return;
+        }
+        if self.upcoming_selection().is_none() {
+            self.notify_no_upcoming_song();
+            return;
+        }
+        self.up_next_move = true;
+        self.notification = Some(Notification::info(
+            "Move mode",
+            "Use j/k or the arrow keys to reorder, then v, Enter, or Esc to keep it.",
+        ));
+    }
+
+    fn leave_up_next_move_mode(&mut self) {
+        self.up_next_move = false;
+        self.notification = Some(Notification::info("Queue", "Your new order was kept."));
+    }
+
+    fn handle_up_next_move_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.shift_selected_upcoming(QueueShift::Down);
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.shift_selected_upcoming(QueueShift::Up);
+                true
+            }
+            KeyCode::Char('v') | KeyCode::Enter | KeyCode::Esc => {
+                self.leave_up_next_move_mode();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn shift_selected_upcoming(&mut self, shift: QueueShift) {
+        let Some(index) = self.upcoming_selection() else {
+            self.leave_up_next_move_mode();
+            return;
+        };
+        if let Some(index) = self.playback.shift_upcoming(index, shift) {
+            self.up_next_state.select(Some(index));
+        }
+    }
+
     fn playback_error(&mut self, message: String) {
         self.playback.status = PlaybackStatus::Error;
         let mut full_message = if self.playback.diagnostics.is_empty() {
@@ -1972,6 +2112,7 @@ impl App {
     }
 
     fn previous_player_tab(&mut self) {
+        self.up_next_move = false;
         self.player_tab = self
             .player_tab
             .checked_sub(1)
@@ -1979,6 +2120,7 @@ impl App {
     }
 
     fn next_player_tab(&mut self) {
+        self.up_next_move = false;
         self.player_tab = (self.player_tab + 1) % PLAYER_TABS.len();
     }
 }
@@ -2063,6 +2205,14 @@ mod tests {
         assert!(!lyrics_response_matches(Some("current"), "previous"));
         assert!(!lyrics_response_matches(None, "previous"));
         assert!(lyrics_response_matches(Some("current"), "current"));
+    }
+
+    #[test]
+    fn builds_the_canonical_watch_url_for_the_playing_song() {
+        assert_eq!(
+            watch_url("dQw4w9WgXcQ"),
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        );
     }
 
     fn playback(video_id: &str) -> PlaybackTrack {

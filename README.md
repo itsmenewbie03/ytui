@@ -155,7 +155,20 @@ In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` 
 | `Space` | Pause or resume |
 | `[` / `]` | Seek backward or forward 10 seconds |
 | `p` / `n` | Play the previous or next queue item |
+| `c` | Copy the current song's YouTube link |
 | `h` / `l`, `Tab` / `Shift+Tab` | Change full-player tab |
+
+### 🔀 Up Next
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` or `Down` / `Up` | Select an upcoming song |
+| `N` | Play the selected song next |
+| `v` | Enter or leave move mode |
+| `j` / `k` or `Down` / `Up` in move mode | Move the selected song up or down |
+| `Enter` | Play the selected song, or leave move mode |
+
+Move mode only reorders songs you have not played yet: the current song and anything before it stay put. Reordering applies immediately, and the new order sticks. In move mode, the status line turns into a `MOVE MODE` hint, and `v`, `Enter`, or `Esc` leaves the mode and keeps your changes. The queue reorders only for the current session; ytui never rewrites a YouTube Music playlist on your behalf.
 
 ## 🧪 Development
 

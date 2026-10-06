@@ -6,8 +6,69 @@ const BINILYRICS_SEARCH_URL: &str = "https://lyrics-api.binimum.org/getLyrics";
 const BINILYRICS_STORAGE_HOST: &str = "lyrics-storage.binimum.org";
 const LRC_RED_HOST: &str = "lrc.red";
 const LRCLIB_URL: &str = "https://lrclib.net/api/get";
+const LRCLIB_SEARCH_URL: &str = "https://lrclib.net/api/search";
 const UNISON_URL: &str = "https://unison.boidu.dev/lyrics";
+const KPOE_MIRRORS: &[&str] = &[
+    "https://lyricsplus.prjktla.my.id",
+    "https://lyricsplus.binimum.org",
+    "https://lyricsplus.prjktla.workers.dev",
+];
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Title tokens that describe the *upload* rather than the song. A bracketed
+/// group containing any of these is dropped before querying a provider.
+const TITLE_NOISE_TOKENS: &[&str] = &[
+    "official",
+    "lyric",
+    "lyrics",
+    "clip",
+    "visualizer",
+    "visualiseur",
+    "trailer",
+    "teaser",
+    "live",
+    "remaster",
+    "remastered",
+    "remasterise",
+    "sped",
+    "slowed",
+    "reverb",
+    "nightcore",
+    "audio",
+    "video",
+    "feat",
+    "ft",
+    "featuring",
+    "4k",
+    "1080p",
+    "720p",
+    "hd",
+    "hq",
+];
+
+/// Same idea, but matched against the separator-free form so `M/V`, `Clip
+/// Officiel` and `Bande Annonce` are recognised as single units.
+const TITLE_NOISE_PHRASES: &[&str] = &[
+    "mv",
+    "mvofficial",
+    "clipofficiel",
+    "videoversio",
+    "videoriginal",
+    "bandeannonce",
+    "lyrique",
+    "paroles",
+    "letra",
+    "letras",
+];
+
+/// Channel-name decorations that are never part of a credited artist.
+const ARTIST_NOISE_TOKENS: &[&str] = &["topic", "official"];
+
+/// Channel-name decorations glued onto the end of an artist token.
+const ARTIST_NOISE_SUFFIXES: &[&str] = &["vevo", "topic"];
+
+/// Artists a provider has no real name for, so matching must not require one.
+const PLACEHOLDER_ARTISTS: &[&str] = &["unknown artist", "unknown artists", "unknown"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LyricsTiming {
@@ -96,13 +157,15 @@ impl LyricsClient {
     }
 
     pub async fn fetch(&self, track: LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
-        let (bini, unison, lrclib) = tokio::join!(
+        let (bini, kpoe, unison, lrclib) = tokio::join!(
             self.fetch_binilyrics(&track),
+            self.fetch_kpoe(&track),
             self.fetch_unison(&track),
             self.fetch_lrclib(&track)
         );
         let candidates = [
             bini.as_ref().ok(),
+            kpoe.as_ref().ok(),
             unison.as_ref().ok(),
             lrclib.as_ref().ok(),
         ]
@@ -115,13 +178,14 @@ impl LyricsClient {
             return Ok(Some(lyrics));
         }
 
-        match (bini, unison, lrclib) {
-            (Err(bini), Err(unison), Err(lrclib)) => Err(LyricsFetchError(format!(
-                "lyrics providers failed: {bini}; {unison}; {lrclib}"
+        match (bini, kpoe, unison, lrclib) {
+            (Err(bini), Err(kpoe), Err(unison), Err(lrclib)) => Err(LyricsFetchError(format!(
+                "lyrics providers failed: {bini}; {kpoe}; {unison}; {lrclib}"
             ))),
-            (Err(error), Ok(None), Ok(None)) => Err(error),
-            (Ok(None), Err(error), Ok(None)) => Err(error),
-            (Ok(None), Ok(None), Err(error)) => Err(error),
+            (Err(error), Ok(None), Ok(None), Ok(None)) => Err(error),
+            (Ok(None), Err(error), Ok(None), Ok(None)) => Err(error),
+            (Ok(None), Ok(None), Err(error), Ok(None)) => Err(error),
+            (Ok(None), Ok(None), Ok(None), Err(error)) => Err(error),
             _ => Ok(None),
         }
     }
@@ -130,7 +194,8 @@ impl LyricsClient {
         &self,
         track: &LyricsTrack,
     ) -> Result<Option<Lyrics>, LyricsFetchError> {
-        let query = format!("{} {}", track.title, track.artist);
+        let terms = SearchTerms::from_track(track);
+        let query = format!("{} {}", terms.title, terms.artist);
         let response = self
             .client
             .get(BINILYRICS_SEARCH_URL)
@@ -177,20 +242,63 @@ impl LyricsClient {
     }
 
     async fn fetch_lrclib(&self, track: &LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
+        let terms = SearchTerms::from_track(track);
+
         let mut query = vec![
-            ("track_name", track.title.as_str()),
-            ("artist_name", track.artist.as_str()),
+            ("track_name", terms.title.as_str()),
+            ("artist_name", terms.artist.as_str()),
         ];
-        if let Some(album) = track.album.as_deref() {
+        if let Some(album) = terms.album.as_deref() {
             query.push(("album_name", album));
         }
-        let duration = track.duration_seconds.map(|duration| duration.to_string());
+        let duration = terms.duration.map(|duration| duration.to_string());
         if let Some(duration) = duration.as_deref() {
             query.push(("duration", duration));
         }
+
+        if let Some(lyrics) = self.lrclib_lookup(LRCLIB_URL, query).await? {
+            return Ok(lyrics);
+        }
+
+        // `/api/get` only answers exact matches, so a track uploaded as
+        // "GIMS - Est-ce que tu m'aimes ? (Clip officiel)" 404s even though
+        // LRCLIB holds the track. Fall back to the fuzzy search endpoint.
+        let mut search = vec![("track_name", terms.title.as_str())];
+        if terms.artist_known {
+            search.push(("artist_name", terms.artist.as_str()));
+        }
+
         let response = self
             .client
-            .get(LRCLIB_URL)
+            .get(LRCLIB_SEARCH_URL)
+            .query(&search)
+            .send()
+            .await
+            .map_err(provider_error("LRCLIB search"))?;
+        let Some(body) = response_body(response, "LRCLIB search").await? else {
+            return Ok(None);
+        };
+        let results: Vec<LrcLibSearchResult> = serde_json::from_slice(&body).map_err(|error| {
+            LyricsFetchError(format!("invalid LRCLIB search response: {error}"))
+        })?;
+        let Some(result) = best_lrclib_match(&terms, results) else {
+            return Ok(None);
+        };
+
+        Ok(parse_lrclib(LrcLibResponse {
+            synced_lyrics: result.synced_lyrics,
+            plain_lyrics: result.plain_lyrics,
+        }))
+    }
+
+    async fn lrclib_lookup(
+        &self,
+        url: &str,
+        query: Vec<(&str, &str)>,
+    ) -> Result<Option<Option<Lyrics>>, LyricsFetchError> {
+        let response = self
+            .client
+            .get(url)
             .query(&query)
             .send()
             .await
@@ -200,7 +308,7 @@ impl LyricsClient {
         };
         let response: LrcLibResponse = serde_json::from_slice(&body)
             .map_err(|error| LyricsFetchError(format!("invalid LRCLIB response: {error}")))?;
-        Ok(parse_lrclib(response))
+        Ok(Some(parse_lrclib(response)))
     }
 
     async fn fetch_unison(&self, track: &LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
@@ -210,14 +318,15 @@ impl LyricsClient {
             return Ok(Some(lyrics));
         }
 
+        let terms = SearchTerms::from_track(track);
         let mut query = vec![
-            ("song", track.title.as_str()),
-            ("artist", track.artist.as_str()),
+            ("song", terms.title.as_str()),
+            ("artist", terms.artist.as_str()),
         ];
-        if let Some(album) = track.album.as_deref() {
+        if let Some(album) = terms.album.as_deref() {
             query.push(("album", album));
         }
-        let duration = track.duration_seconds.map(|duration| duration.to_string());
+        let duration = terms.duration.map(|duration| duration.to_string());
         if let Some(duration) = duration.as_deref() {
             query.push(("duration", duration));
         }
@@ -241,6 +350,87 @@ impl LyricsClient {
         let response: UnisonResponse = serde_json::from_slice(&body)
             .map_err(|error| LyricsFetchError(format!("invalid Unison response: {error}")))?;
         Ok(parse_unison(response))
+    }
+
+    /// Lyrics+ aggregates Apple Music, QQ, Musixmatch and Spotify, which is where
+    /// most word-synced lyrics come from. It has no stable host, so try each
+    /// mirror in turn and keep the first that answers.
+    async fn fetch_kpoe(&self, track: &LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
+        let terms = SearchTerms::from_track(track);
+        let duration = terms
+            .duration
+            .map(|duration| duration.to_string())
+            .unwrap_or_default();
+        let mut query = vec![
+            ("title", terms.title.as_str()),
+            ("artist", terms.artist.as_str()),
+        ];
+        if let Some(album) = terms.album.as_deref() {
+            query.push(("album", album));
+        }
+        if !duration.is_empty() {
+            query.push(("duration", duration.as_str()));
+        }
+
+        let mut last_error = None;
+        for (index, mirror) in KPOE_MIRRORS.iter().enumerate() {
+            match self.kpoe_request(mirror, "/v1/ttml/get", &query).await {
+                Ok(Some(lyrics)) => return Ok(Some(lyrics)),
+                Ok(None) => {}
+                Err(error) => last_error = Some(error),
+            }
+
+            // The first mirror is the maintained one, so it is also the only one
+            // worth a second ask for the JSON format.
+            if index == 0
+                && let Ok(Some(lyrics)) = self.kpoe_request(mirror, "/v2/lyrics/get", &query).await
+            {
+                return Ok(Some(lyrics));
+            }
+        }
+
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    async fn kpoe_request(
+        &self,
+        mirror: &str,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<Lyrics>, LyricsFetchError> {
+        let url = format!("{mirror}{path}");
+        let response = self
+            .client
+            .get(&url)
+            .query(query)
+            .header(
+                "X-Client-Package",
+                "ytui <https://github.com/itsmenewbie03/ytui>",
+            )
+            .send()
+            .await
+            .map_err(provider_error("Lyrics+"))?;
+        let Some(body) = response_body(response, "Lyrics+").await? else {
+            return Ok(None);
+        };
+        let response: KpoeResponse = serde_json::from_slice(&body)
+            .map_err(|error| LyricsFetchError(format!("invalid Lyrics+ response: {error}")))?;
+
+        // `/v1/ttml/get` already speaks the TTML we parse for Apple Music, which
+        // keeps syllable timing exactly as the label published it.
+        if let Some(document) = response.ttml.as_deref()
+            && let Ok(lyrics) = Lyrics::from_ttml(document)
+        {
+            return Ok(Some(Lyrics {
+                source: "Lyrics+".to_owned(),
+                ..lyrics
+            }));
+        }
+
+        Ok(parse_kpoe(response))
     }
 }
 
@@ -378,6 +568,62 @@ struct LrcLibResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LrcLibSearchResult {
+    #[serde(default)]
+    track_name: String,
+    #[serde(default)]
+    artist_name: String,
+    #[serde(default)]
+    duration: f64,
+    synced_lyrics: Option<String>,
+    plain_lyrics: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KpoeResponse {
+    #[serde(default)]
+    ttml: Option<String>,
+    #[serde(default, rename = "type")]
+    timing: String,
+    #[serde(default)]
+    metadata: Option<KpoeMetadata>,
+    #[serde(default)]
+    lyrics: Vec<KpoeLine>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KpoeMetadata {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    song_writers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct KpoeLine {
+    #[serde(default)]
+    time: Option<u64>,
+    #[serde(default)]
+    duration: Option<u64>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    syllabus: Vec<KpoeSyllable>,
+}
+
+#[derive(Deserialize)]
+struct KpoeSyllable {
+    #[serde(default)]
+    time: Option<u64>,
+    #[serde(default)]
+    duration: Option<u64>,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
 struct UnisonResponse {
     #[serde(default)]
     success: bool,
@@ -443,6 +689,9 @@ fn allowed_provider_url(url: &reqwest::Url) -> bool {
                     | "lrc.red"
                     | "lrclib.net"
                     | "unison.boidu.dev"
+                    | "lyricsplus.prjktla.my.id"
+                    | "lyricsplus.binimum.org"
+                    | "lyricsplus.prjktla.workers.dev"
             )
         )
 }
@@ -451,62 +700,48 @@ fn best_bini_match(
     track: &LyricsTrack,
     results: Vec<BiniLyricsResult>,
 ) -> Option<BiniLyricsResult> {
+    let terms = SearchTerms::from_track(track);
     results
         .into_iter()
         .filter(|result| !result.lyrics_url.is_empty())
-        .filter(|result| {
-            let target_title = normalized_match_text(&track.title);
-            let result_title = normalized_match_text(&result.track_name);
-            let target_artist = normalized_match_text(&track.artist);
-            let result_artist = normalized_match_text(&result.artist_name);
-            let title_matches = !target_title.is_empty()
-                && !result_title.is_empty()
-                && (target_title == result_title
-                    || target_title.contains(&result_title)
-                    || result_title.contains(&target_title));
-            let artist_matches = !target_artist.is_empty()
-                && !result_artist.is_empty()
-                && (target_artist == result_artist
-                    || target_artist.contains(&result_artist)
-                    || result_artist.contains(&target_artist));
-            let duration_matches = track.duration_seconds.is_none_or(|duration| {
-                result.duration <= 0.0 || (result.duration - duration as f64).abs() <= 8.0
-            });
-            title_matches && artist_matches && duration_matches
+        .filter_map(|result| {
+            let score = match_score(
+                &terms,
+                &result.track_name,
+                &result.artist_name,
+                Some(result.duration),
+            )?;
+            Some((score, result))
         })
-        .max_by_key(|result| {
-            let target_title = normalized_match_text(&track.title);
-            let result_title = normalized_match_text(&result.track_name);
-            let target_artist = normalized_match_text(&track.artist);
-            let result_artist = normalized_match_text(&result.artist_name);
-            let mut score = 0;
-            if !target_title.is_empty() && target_title == result_title {
-                score += 15;
-            } else if !result_title.is_empty()
-                && (target_title.contains(&result_title) || result_title.contains(&target_title))
-            {
-                score += 10;
-            }
-            if !target_artist.is_empty() && target_artist == result_artist {
-                score += 15;
-            } else if !result_artist.is_empty()
-                && (target_artist.contains(&result_artist)
-                    || result_artist.contains(&target_artist))
-            {
-                score += 10;
-            }
-            if let Some(duration) = track.duration_seconds {
-                let difference = (result.duration - duration as f64).abs();
-                score += if difference <= 3.0 {
-                    5
-                } else if difference <= 8.0 {
-                    2
-                } else {
-                    0
-                };
-            }
-            score
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, result)| result)
+}
+
+/// Picks the best LRCLIB search hit. Search is fuzzy, so unlike `/api/get` it
+/// routinely returns several near-misses that need ranking.
+fn best_lrclib_match(
+    terms: &SearchTerms,
+    results: Vec<LrcLibSearchResult>,
+) -> Option<LrcLibSearchResult> {
+    results
+        .into_iter()
+        .filter_map(|result| {
+            let score = match_score(
+                terms,
+                &result.track_name,
+                &result.artist_name,
+                Some(result.duration),
+            )?;
+            Some((score, result))
         })
+        .max_by_key(|(score, result)| {
+            (
+                *score,
+                result.synced_lyrics.is_some(),
+                result.plain_lyrics.is_some(),
+            )
+        })
+        .map(|(_, result)| result)
 }
 
 fn normalized_match_text(value: &str) -> String {
@@ -515,6 +750,240 @@ fn normalized_match_text(value: &str) -> String {
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
         .collect()
+}
+
+/// The provider-facing view of a track: upload noise removed, and a flag for
+/// whether the artist is real enough to insist on when matching results.
+#[derive(Clone, Debug, PartialEq)]
+struct SearchTerms {
+    title: String,
+    artist: String,
+    album: Option<String>,
+    duration: Option<f64>,
+    artist_known: bool,
+}
+
+impl SearchTerms {
+    fn from_track(track: &LyricsTrack) -> Self {
+        let artist = clean_artist(&track.artist);
+        let normalized_artist = normalized_match_text(&artist);
+        let artist_known = !normalized_artist.is_empty()
+            && !PLACEHOLDER_ARTISTS
+                .iter()
+                .any(|placeholder| normalized_artist == normalized_match_text(placeholder));
+
+        Self {
+            title: clean_title(&track.title, &artist),
+            artist,
+            album: track.album.as_deref().map(|album| album.trim().to_owned()),
+            duration: track.duration_seconds.map(|duration| duration as f64),
+            artist_known,
+        }
+    }
+}
+
+/// Removes upload noise from a raw video title: bracketed groups and trailing
+/// ` - ...` segments that only describe the upload. Returns the original when
+/// stripping would leave nothing behind.
+fn clean_title(title: &str, artist: &str) -> String {
+    let mut current = strip_artist_prefix(title.trim(), artist).trim();
+
+    loop {
+        current = trim_separators(current);
+        let before = current;
+
+        if let Some((open, inner)) = bracketed_suffix(current) {
+            if is_title_noise(inner) {
+                current = current[..open].trim_end();
+            }
+        } else if let Some(index) = trailing_segment(current)
+            && is_title_noise(&current[index..])
+        {
+            current = current[..index].trim_end();
+        }
+
+        if current == before {
+            break;
+        }
+    }
+
+    let cleaned = trim_separators(current);
+    if cleaned.is_empty() {
+        title.trim().to_owned()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+/// Byte offset of the last ` - ` separator, whose trailing segment is the
+/// next candidate for removal.
+fn trailing_segment(value: &str) -> Option<usize> {
+    value.rfind(" - ")
+}
+
+/// Drops a leading `ARTIST - ` prefix, but only when it really is the artist.
+fn strip_artist_prefix<'a>(title: &'a str, artist: &str) -> &'a str {
+    let normalized_artist = normalized_match_text(artist);
+    if normalized_artist.is_empty() {
+        return title;
+    }
+
+    for separator in [" - ", " – ", " — ", " | "] {
+        let Some(index) = title.find(separator) else {
+            continue;
+        };
+        let candidate = normalized_match_text(&title[..index]);
+        if !candidate.is_empty()
+            && (candidate == normalized_artist
+                || candidate.contains(&normalized_artist)
+                || normalized_artist.contains(&candidate))
+        {
+            return &title[index + separator.len()..];
+        }
+    }
+
+    title
+}
+
+/// Returns the byte offset and inner text of a trailing `(...)` or `[...]` group.
+fn bracketed_suffix(value: &str) -> Option<(usize, &str)> {
+    let (open, close) = match value.as_bytes().last()? {
+        b')' => (b'(', b')'),
+        b']' => (b'[', b']'),
+        _ => return None,
+    };
+    let open = value.rfind(open as char)?;
+    let inner = &value[open + 1..value.len() - 1];
+    (!inner.contains(close as char) && !inner.contains('\n')).then_some((open, inner))
+}
+
+fn is_title_noise(inner: &str) -> bool {
+    let tokens = tokens(inner);
+    if tokens
+        .iter()
+        .any(|token| TITLE_NOISE_TOKENS.contains(&token.as_str()))
+    {
+        return true;
+    }
+    TITLE_NOISE_PHRASES.contains(&tokens.concat().as_str())
+}
+
+/// Splits on any non-alphanumeric run and lowercases, so `feat. Jane` and
+/// `M/V` tokenize the way a reader would.
+fn tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            current.push(character);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Trims channel decoration from an artist while preserving its original
+/// casing, since the cleaned value is still sent to providers as a query.
+fn clean_artist(artist: &str) -> String {
+    let mut kept = split_words(artist);
+    loop {
+        // `GIMS - Topic` leaves a dangling `-` once the marker is dropped.
+        while let Some(last) = kept.last()
+            && !last.chars().any(char::is_alphanumeric)
+        {
+            kept.pop();
+        }
+        let Some(last) = kept.last_mut() else {
+            break;
+        };
+        let lowered = last.to_lowercase();
+        if ARTIST_NOISE_TOKENS.contains(&lowered.as_str()) {
+            kept.pop();
+            continue;
+        }
+        match ARTIST_NOISE_SUFFIXES.iter().find_map(|suffix| {
+            lowered
+                .strip_suffix(suffix)
+                .filter(|stem| !stem.is_empty())
+                .map(str::len)
+        }) {
+            Some(new_len) => last.truncate(new_len),
+            None => break,
+        }
+    }
+    kept.join(" ")
+}
+
+/// Splits on whitespace only, so casing and punctuation survive.
+fn split_words(value: &str) -> Vec<String> {
+    value.split_whitespace().map(str::to_owned).collect()
+}
+
+fn trim_separators(value: &str) -> &str {
+    value
+        .trim_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '-' | '–' | '—' | '|' | '·' | '/' | ',')
+        })
+        .trim()
+}
+
+/// Scores a provider result against the search terms, or rejects it outright.
+/// Shared by BiniLyrics and LRCLIB so both rank candidates identically.
+fn match_score(
+    terms: &SearchTerms,
+    title: &str,
+    artist: &str,
+    duration: Option<f64>,
+) -> Option<u32> {
+    let target_title = normalized_match_text(&terms.title);
+    let title = normalized_match_text(title);
+    let target_artist = normalized_match_text(&terms.artist);
+    let artist = normalized_match_text(artist);
+
+    // Title outweighs artist: a matching title with a `feat.` suffix on the
+    // artist is still the same song, but a mismatched title is a different one.
+    let title_score = if target_title.is_empty() || title.is_empty() {
+        0
+    } else if target_title == title {
+        20
+    } else if target_title.contains(&title) || title.contains(&target_title) {
+        10
+    } else {
+        return None;
+    };
+
+    let artist_score = if target_artist.is_empty() || artist.is_empty() {
+        0
+    } else if target_artist == artist {
+        15
+    } else if target_artist.contains(&artist) || artist.contains(&target_artist) {
+        10
+    } else if terms.artist_known {
+        return None;
+    } else {
+        0
+    };
+
+    let duration_score = match (terms.duration, duration) {
+        (Some(target), Some(candidate)) if candidate > 0.0 => {
+            let difference = (candidate - target).abs();
+            if difference <= 3.0 {
+                5
+            } else if difference <= 8.0 {
+                2
+            } else {
+                return None;
+            }
+        }
+        _ => 0,
+    };
+
+    Some(title_score + artist_score + duration_score)
 }
 
 fn parse_lrclib(response: LrcLibResponse) -> Option<Lyrics> {
@@ -615,6 +1084,111 @@ fn unison_sync_timing(sync_type: &str) -> Option<LyricsTiming> {
         "plain" => Some(LyricsTiming::Plain),
         _ => None,
     }
+}
+
+/// Parses the Lyrics+ v2 payload, which carries timings in milliseconds with
+/// `duration` rather than `end`. Syllables keep their own trailing space, which
+/// is what glues consecutive words back together.
+fn parse_kpoe(response: KpoeResponse) -> Option<Lyrics> {
+    let mut pending = response
+        .lyrics
+        .into_iter()
+        .filter_map(|line| {
+            let start_ms = line.time?;
+            let syllables = line
+                .syllabus
+                .into_iter()
+                .filter_map(|syllable| {
+                    let start_ms = syllable.time?;
+                    let text = syllable.text.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let tail = if syllable.text.ends_with(char::is_whitespace) {
+                        " "
+                    } else {
+                        ""
+                    };
+                    let end_ms = start_ms.saturating_add(syllable.duration.unwrap_or(0));
+                    Some(LyricSyllable {
+                        text: text.to_owned(),
+                        tail: tail.to_owned(),
+                        start_ms,
+                        end_ms,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let text = if syllables.is_empty() {
+                let text = line.text.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                text.to_owned()
+            } else {
+                syllables
+                    .iter()
+                    .map(|syllable| syllable.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            Some((
+                start_ms,
+                start_ms.saturating_add(line.duration.unwrap_or(0)),
+                text,
+                syllables,
+            ))
+        })
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|(start, ..)| *start);
+    if pending.is_empty() {
+        return None;
+    }
+
+    let timing = if pending
+        .iter()
+        .any(|(_, _, _, syllables)| !syllables.is_empty())
+    {
+        LyricsTiming::SyllableSynced
+    } else if response.timing.eq_ignore_ascii_case("line") {
+        LyricsTiming::LineSynced
+    } else {
+        LyricsTiming::Plain
+    };
+
+    let last_index = pending.len() - 1;
+    let lines = pending
+        .iter()
+        .enumerate()
+        .map(|(index, (start_ms, end_ms, text, syllables))| LyricLine {
+            text: text.clone(),
+            start_ms: Some(*start_ms),
+            end_ms: Some(if *end_ms > *start_ms {
+                *end_ms
+            } else if index == last_index {
+                start_ms.saturating_add(5_000)
+            } else {
+                pending[index + 1].0
+            }),
+            syllables: syllables.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let metadata = response.metadata.unwrap_or(KpoeMetadata {
+        source: String::new(),
+        song_writers: Vec::new(),
+    });
+    let source = if metadata.source.trim().is_empty() {
+        "Lyrics+".to_owned()
+    } else {
+        format!("Lyrics+ ({})", metadata.source.trim())
+    };
+
+    Some(Lyrics {
+        timing,
+        lines,
+        source,
+        songwriters: metadata.song_writers,
+    })
 }
 
 fn parse_lrc(document: &str) -> Option<Vec<LyricLine>> {
@@ -832,10 +1406,32 @@ fn parse_number(value: &str, original: &str) -> Result<f64, TtmlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BiniLyricsResult, LrcLibResponse, Lyrics, LyricsClient, LyricsTiming, LyricsTrack,
-        UnisonData, UnisonResponse, allowed_provider_url, best_bini_match, parse_lrclib,
-        parse_unison, unison_sync_timing,
+        BiniLyricsResult, KpoeLine, KpoeMetadata, KpoeResponse, KpoeSyllable, LrcLibResponse,
+        LrcLibSearchResult, Lyrics, LyricsClient, LyricsTiming, LyricsTrack, SearchTerms,
+        UnisonData, UnisonResponse, allowed_provider_url, best_bini_match, best_lrclib_match,
+        clean_artist, clean_title, match_score, parse_kpoe, parse_lrclib, parse_unison, tokens,
+        unison_sync_timing,
     };
+
+    fn track(title: &str, artist: &str, duration: Option<u64>) -> LyricsTrack {
+        LyricsTrack {
+            title: title.to_owned(),
+            artist: artist.to_owned(),
+            album: None,
+            duration_seconds: duration,
+            video_id: None,
+        }
+    }
+
+    fn lrclib_hit(track_name: &str, artist_name: &str, duration: f64) -> LrcLibSearchResult {
+        LrcLibSearchResult {
+            track_name: track_name.to_owned(),
+            artist_name: artist_name.to_owned(),
+            duration,
+            synced_lyrics: Some("[00:01.00]First".to_owned()),
+            plain_lyrics: None,
+        }
+    }
 
     #[test]
     fn parses_syllable_synced_ttml() {
@@ -1165,6 +1761,72 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live lyrics provider compatibility probe"]
+    async fn loads_synced_lyrics_for_a_noisy_video_title() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch(LyricsTrack {
+                title: "GIMS - Est-ce que tu m'aimes ? (Clip officiel)".to_owned(),
+                artist: "GIMS".to_owned(),
+                album: Some("Est-ce que tu m'aimes ?".to_owned()),
+                duration_seconds: Some(242),
+                video_id: None,
+            })
+            .await
+            .unwrap()
+            .expect("this track exists on LRCLIB and Lyrics+");
+
+        assert!(
+            lyrics.timing > LyricsTiming::Plain,
+            "expected timed lyrics, got {:?} from {}",
+            lyrics.timing,
+            lyrics.source
+        );
+        assert!(!lyrics.lines.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
+    async fn loads_syllable_synced_lyrics_from_live_kpoe() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch_kpoe(&LyricsTrack {
+                title: "Marilag".to_owned(),
+                artist: "Dionela".to_owned(),
+                album: Some("Marilag - Single".to_owned()),
+                duration_seconds: Some(158),
+                video_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert!(lyrics.source.starts_with("Lyrics+"));
+        assert!(!lyrics.lines.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
+    async fn loads_synced_lyrics_for_a_placeholder_artist() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch(LyricsTrack {
+                title: "Est-ce que tu m'aimes ?".to_owned(),
+                artist: "Unknown artist".to_owned(),
+                album: None,
+                duration_seconds: Some(212),
+                video_id: None,
+            })
+            .await;
+
+        assert!(
+            matches!(&lyrics, Ok(Some(lyrics)) if lyrics.timing > LyricsTiming::Plain),
+            "a Topic channel track with no artist metadata should still resolve: {lyrics:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
     async fn loads_syllable_synced_lyrics_from_live_unison() {
         let lyrics = LyricsClient::new()
             .unwrap()
@@ -1204,6 +1866,229 @@ mod tests {
         assert_eq!(lyrics.source, "Apple (via BiniLyrics)");
         assert_eq!(lyrics.songwriters, ["Dionela"]);
         assert!(!lyrics.lines.is_empty());
+    }
+
+    #[test]
+    fn strips_upload_noise_from_titles() {
+        assert_eq!(
+            clean_title("GIMS - Est-ce que tu m'aimes ? (Clip officiel)", "GIMS"),
+            "Est-ce que tu m'aimes ?"
+        );
+        assert_eq!(
+            clean_title("Marilag (Official Music Video) [4K]", "Dionela"),
+            "Marilag"
+        );
+        assert_eq!(clean_title("Song [Official Lyric Video]", "X"), "Song");
+        assert_eq!(clean_title("Song (feat. Someone)", "X"), "Song");
+        assert_eq!(clean_title("Song - Live", "X"), "Song");
+        assert_eq!(clean_title("Song (M/V)", "X"), "Song");
+    }
+
+    #[test]
+    fn keeps_meaningful_title_detail() {
+        assert_eq!(
+            clean_title("Song (Acoustic Version)", "X"),
+            "Song (Acoustic Version)"
+        );
+        assert_eq!(clean_title("Song (Sped Up)", "X"), "Song");
+        assert_eq!(clean_title("Plain Title", "X"), "Plain Title");
+    }
+
+    #[test]
+    fn keeps_the_original_title_when_stripping_would_empty_it() {
+        assert_eq!(clean_title("(Official Video)", "X"), "(Official Video)");
+    }
+
+    #[test]
+    fn leaves_artist_prefix_alone_when_it_is_not_the_artist() {
+        assert_eq!(
+            clean_title("Billie Eilish - Bad Guy", "Someone Else"),
+            "Billie Eilish - Bad Guy"
+        );
+    }
+
+    #[test]
+    fn strips_channel_decoration_from_artists() {
+        assert_eq!(clean_artist("GIMS - Topic"), "GIMS");
+        assert_eq!(clean_artist("GIMS - topic"), "GIMS");
+        assert_eq!(clean_artist("GIMSVEVO"), "GIMS");
+        assert_eq!(clean_artist("Ed Sheeran"), "Ed Sheeran");
+        assert_eq!(clean_artist("ArianaGrandeVEVO"), "ArianaGrande");
+        assert_eq!(clean_artist("Topic"), "");
+    }
+
+    #[test]
+    fn preserves_artist_casing_because_it_is_still_queried() {
+        assert_eq!(clean_artist("GIMS"), "GIMS");
+        assert_eq!(clean_artist("Billie Eilish"), "Billie Eilish");
+        assert_eq!(clean_artist("GIMS - Topic"), "GIMS");
+    }
+
+    #[test]
+    fn tokenizes_for_noise_detection_without_swallowing_real_words() {
+        assert_eq!(tokens("feat. Jane"), ["feat", "jane"]);
+        assert_eq!(tokens("M/V"), ["m", "v"]);
+        assert_eq!(tokens("4K"), ["4k"]);
+    }
+
+    #[test]
+    fn ranks_a_matching_title_above_an_exact_artist_on_another_song() {
+        let terms = SearchTerms::from_track(&track("Tahanan", "Adie", Some(196)));
+        assert!(
+            match_score(&terms, "Tahanan", "Adie feat. Someone", Some(196.0))
+                > match_score(&terms, "Tahanan Live", "Adie", Some(196.0))
+        );
+    }
+
+    #[test]
+    fn ranks_a_matching_title_above_a_mere_containment() {
+        let terms = SearchTerms::from_track(&track("Tahanan", "Adie", Some(196)));
+        let exact = best_lrclib_match(
+            &terms,
+            vec![
+                lrclib_hit("Tahanan", "Adie feat. Someone", 196.0),
+                lrclib_hit("Tahanan Live", "Adie", 196.0),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(exact.track_name, "Tahanan");
+    }
+
+    #[test]
+    fn rejects_lrclib_hits_for_other_songs_and_versions() {
+        let terms = SearchTerms::from_track(&track("Tahanan", "Adie", Some(196)));
+
+        assert!(
+            best_lrclib_match(&terms, vec![lrclib_hit("Different Song", "Adie", 196.0)]).is_none()
+        );
+        assert!(
+            best_lrclib_match(&terms, vec![lrclib_hit("Tahanan", "Other Artist", 196.0)]).is_none()
+        );
+        assert!(
+            best_lrclib_match(&terms, vec![lrclib_hit("Tahanan", "Adie", 294.0)]).is_none(),
+            "a live cut at a different duration is a different song"
+        );
+    }
+
+    #[test]
+    fn ignores_the_artist_when_the_track_does_not_name_one() {
+        let terms = SearchTerms::from_track(&track("Tahanan", "Unknown artist", Some(196)));
+        assert!(!terms.artist_known);
+        assert!(
+            best_lrclib_match(&terms, vec![lrclib_hit("Tahanan", "Adie", 196.0)]).is_some(),
+            "a placeholder artist must not veto an otherwise exact title match"
+        );
+    }
+
+    fn kpoe_syllable(time: u64, duration: u64, text: &str) -> KpoeSyllable {
+        KpoeSyllable {
+            time: Some(time),
+            duration: Some(duration),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn parses_word_synced_kpoe_payloads() {
+        let lyrics = parse_kpoe(KpoeResponse {
+            ttml: None,
+            timing: "Word".to_owned(),
+            metadata: Some(KpoeMetadata {
+                source: "Apple".to_owned(),
+                song_writers: vec!["GIMS".to_owned()],
+            }),
+            lyrics: vec![KpoeLine {
+                time: Some(907),
+                duration: Some(2991),
+                text: "Hotshot, running nonstop".to_owned(),
+                syllabus: vec![
+                    kpoe_syllable(907, 782, "Hotshot, "),
+                    kpoe_syllable(1689, 404, "running "),
+                    kpoe_syllable(2093, 155, "nonstop"),
+                ],
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(lyrics.source, "Lyrics+ (Apple)");
+        assert_eq!(lyrics.songwriters, ["GIMS"]);
+        assert_eq!(lyrics.lines[0].text, "Hotshot, running nonstop");
+        assert_eq!(lyrics.lines[0].start_ms, Some(907));
+        assert_eq!(lyrics.lines[0].end_ms, Some(3_898));
+        assert_eq!(lyrics.lines[0].syllables.len(), 3);
+        assert_eq!(lyrics.lines[0].syllables[0].text, "Hotshot,");
+        assert_eq!(lyrics.lines[0].syllables[0].tail, " ");
+        assert_eq!(lyrics.lines[0].syllables[2].tail, "");
+    }
+
+    #[test]
+    fn parses_line_only_kpoe_payloads() {
+        let lyrics = parse_kpoe(KpoeResponse {
+            ttml: None,
+            timing: "Line".to_owned(),
+            metadata: Some(KpoeMetadata {
+                source: "QQ Music".to_owned(),
+                song_writers: Vec::new(),
+            }),
+            lyrics: vec![
+                KpoeLine {
+                    time: Some(1_000),
+                    duration: Some(2_000),
+                    text: "First".to_owned(),
+                    syllabus: Vec::new(),
+                },
+                KpoeLine {
+                    time: Some(3_000),
+                    duration: Some(0),
+                    text: "Second".to_owned(),
+                    syllabus: Vec::new(),
+                },
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(lyrics.timing, LyricsTiming::LineSynced);
+        assert_eq!(lyrics.source, "Lyrics+ (QQ Music)");
+        assert_eq!(lyrics.lines[0].end_ms, Some(3_000));
+        assert_eq!(
+            lyrics.lines[1].end_ms,
+            Some(8_000),
+            "a zero-length final line should still get a highlight window"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_kpoe_payloads() {
+        assert!(
+            parse_kpoe(KpoeResponse {
+                ttml: None,
+                timing: "Line".to_owned(),
+                metadata: None,
+                lyrics: Vec::new(),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn allows_kpoe_mirrors_and_rejects_spoofed_hosts() {
+        for mirror in super::KPOE_MIRRORS {
+            assert!(
+                allowed_provider_url(
+                    &reqwest::Url::parse(&format!("{mirror}/v1/ttml/get")).unwrap()
+                ),
+                "{mirror} should be reachable"
+            );
+            assert!(
+                !allowed_provider_url(
+                    &reqwest::Url::parse(&format!("{mirror}.attacker.example/v1/ttml/get"))
+                        .unwrap()
+                ),
+                "{mirror} should not authorize a lookalike host"
+            );
+        }
     }
 
     #[test]

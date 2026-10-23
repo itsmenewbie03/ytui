@@ -40,7 +40,7 @@ You must have the following available on your system:
 - A [Nerd Font](https://www.nerdfonts.com/) for the transport icons
 - An internet connection
 
-Building requires the PipeWire development files (`pipewire` on Arch Linux or `libpipewire-0.3-dev` on Debian and Ubuntu).
+Building requires the PipeWire and ALSA development files (`pipewire` and `alsa-lib` on Arch Linux, or `libpipewire-0.3-dev` and `libasound2-dev` on Debian and Ubuntu). CPAL pulls in the ALSA backend on Linux even though ytui only opens the PipeWire host.
 
 Clipboard support is optional. Install `wl-copy`, `xclip`, or `xsel` if you want to copy playback diagnostics from the app.
 

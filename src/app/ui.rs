@@ -1226,7 +1226,7 @@ impl App {
 
         let body = area;
         let position_ms = (self.playback.position.max(0.0) * 1_000.0) as u64;
-        let active = active_lyric_index(lyrics, position_ms);
+        let active = active_lyric_indices(lyrics, position_ms);
         let visible = usize::from(body.height.max(1));
         let interlude = instrumental_interlude(lyrics, position_ms);
         let interlude_index = interlude.map(|interlude| interlude.insert_before);
@@ -1234,8 +1234,7 @@ impl App {
         let footer = lyrics_footer_lines(lyrics);
         let display_len = lyric_display_len + footer.len();
         let anchor = interlude_index.or_else(|| {
-            active
-                .or_else(|| last_started_lyric_index(lyrics, position_ms))
+            lyric_anchor_index(lyrics, &active, position_ms)
                 .map(|index| display_index_for_lyric(index, interlude_index))
         });
         let start = anchor
@@ -1269,7 +1268,7 @@ impl App {
                 let line = lyrics.lines.get(lyric_index)?;
                 Some(render_lyric_line(
                     line,
-                    Some(lyric_index) == active,
+                    active.contains(&lyric_index),
                     position_ms,
                     accent,
                     highlight,
@@ -1714,15 +1713,34 @@ impl App {
     }
 }
 
-fn active_lyric_index(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
+/// Every line live at `position_ms`. A duet overlaps two voices, and ad-libs
+/// overlap their lead, so this is a set rather than the single line the viewport
+/// scrolls to.
+fn active_lyric_indices(lyrics: &Lyrics, position_ms: u64) -> Vec<usize> {
     if lyrics.timing == LyricsTiming::Plain {
-        return None;
+        return Vec::new();
     }
-    lyrics.lines.iter().rposition(|line| {
-        line.start_ms
-            .is_some_and(|start_ms| start_ms <= position_ms)
-            && line.end_ms.is_none_or(|end_ms| position_ms < end_ms)
-    })
+    lyrics
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.start_ms
+                .is_some_and(|start_ms| start_ms <= position_ms)
+                && line.end_ms.is_none_or(|end_ms| position_ms < end_ms)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The active line the viewport centres on: the earliest-starting one, so the
+/// view does not jump when a concurrent voice begins or ends.
+fn lyric_anchor_index(lyrics: &Lyrics, active: &[usize], position_ms: u64) -> Option<usize> {
+    active
+        .iter()
+        .copied()
+        .min_by_key(|index| lyrics.lines[*index].start_ms)
+        .or_else(|| last_started_lyric_index(lyrics, position_ms))
 }
 
 fn last_started_lyric_index(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
@@ -2482,12 +2500,108 @@ mod tests {
             ],
         };
 
-        assert_eq!(active_lyric_index(&lyrics, 500), None);
-        assert_eq!(active_lyric_index(&lyrics, 1_500), Some(0));
-        assert_eq!(active_lyric_index(&lyrics, 2_500), None);
-        assert_eq!(active_lyric_index(&lyrics, 3_500), Some(1));
-        assert_eq!(active_lyric_index(&lyrics, 10_000), None);
+        assert_eq!(active_lyric_indices(&lyrics, 500), [] as [usize; 0]);
+        assert_eq!(active_lyric_indices(&lyrics, 1_500), [0]);
+        assert_eq!(active_lyric_indices(&lyrics, 2_500), [] as [usize; 0]);
+        assert_eq!(active_lyric_indices(&lyrics, 3_500), [1]);
+        assert_eq!(active_lyric_indices(&lyrics, 10_000), [] as [usize; 0]);
         assert_eq!(last_started_lyric_index(&lyrics, 2_500), Some(0));
+    }
+
+    #[test]
+    fn highlights_concurrent_voices_together() {
+        // A duet: the two voices genuinely overlap from 1.4s to 3.1s, and the
+        // highlight must not bounce between them as playback advances.
+        let lyrics = Lyrics {
+            timing: LyricsTiming::SyllableSynced,
+            source: "test".to_owned(),
+            songwriters: Vec::new(),
+            lines: vec![
+                LyricLine {
+                    text: "Nothin' on you, baby".to_owned(),
+                    start_ms: Some(1_000),
+                    end_ms: Some(4_000),
+                    syllables: Vec::new(),
+                },
+                LyricLine {
+                    text: "No-no-no-nothin' on you".to_owned(),
+                    start_ms: Some(1_400),
+                    end_ms: Some(3_100),
+                    syllables: Vec::new(),
+                },
+                LyricLine {
+                    text: "Next".to_owned(),
+                    start_ms: Some(4_100),
+                    end_ms: Some(5_000),
+                    syllables: Vec::new(),
+                },
+            ],
+        };
+
+        assert_eq!(active_lyric_indices(&lyrics, 1_200), [0]);
+        for position in [1_500, 2_000, 2_900] {
+            assert_eq!(
+                active_lyric_indices(&lyrics, position),
+                [0, 1],
+                "both voices stay lit at {position}ms"
+            );
+        }
+        assert_eq!(active_lyric_indices(&lyrics, 3_500), [0]);
+        assert_eq!(active_lyric_indices(&lyrics, 4_200), [2]);
+    }
+
+    #[test]
+    fn anchors_the_viewport_on_the_earliest_live_voice() {
+        let lyrics = Lyrics {
+            timing: LyricsTiming::SyllableSynced,
+            source: "test".to_owned(),
+            songwriters: Vec::new(),
+            lines: vec![
+                LyricLine {
+                    text: "Lead".to_owned(),
+                    start_ms: Some(1_000),
+                    end_ms: Some(4_000),
+                    syllables: Vec::new(),
+                },
+                LyricLine {
+                    text: "Ad-lib".to_owned(),
+                    start_ms: Some(1_400),
+                    end_ms: Some(3_100),
+                    syllables: Vec::new(),
+                },
+            ],
+        };
+
+        let active = active_lyric_indices(&lyrics, 2_000);
+        assert_eq!(active, [0, 1]);
+        assert_eq!(
+            lyric_anchor_index(&lyrics, &active, 2_000),
+            Some(0),
+            "the earlier voice owns the scroll, so the view does not jump"
+        );
+        assert_eq!(
+            lyric_anchor_index(&lyrics, &active_lyric_indices(&lyrics, 3_500), 3_500),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn anchors_on_the_last_started_line_between_lyrics() {
+        let lyrics = Lyrics {
+            timing: LyricsTiming::LineSynced,
+            source: "test".to_owned(),
+            songwriters: Vec::new(),
+            lines: vec![LyricLine {
+                text: "Only".to_owned(),
+                start_ms: Some(1_000),
+                end_ms: Some(2_000),
+                syllables: Vec::new(),
+            }],
+        };
+
+        let active = active_lyric_indices(&lyrics, 2_500);
+        assert!(active.is_empty());
+        assert_eq!(lyric_anchor_index(&lyrics, &active, 2_500), Some(0));
     }
 
     #[test]

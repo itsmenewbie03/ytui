@@ -26,7 +26,6 @@ const TITLE_NOISE_TOKENS: &[&str] = &[
     "visualiseur",
     "trailer",
     "teaser",
-    "live",
     "remaster",
     "remastered",
     "remasterise",
@@ -69,6 +68,30 @@ const ARTIST_NOISE_SUFFIXES: &[&str] = &["vevo", "topic"];
 
 /// Artists a provider has no real name for, so matching must not require one.
 const PLACEHOLDER_ARTISTS: &[&str] = &["unknown artist", "unknown artists", "unknown"];
+
+/// Distinct recordings that share a title. A candidate carrying one of these is
+/// only a match if the target asks for it too, otherwise `Nothin' on You` would
+/// accept the karaoke track and the remix as readily as the song.
+const VERSION_MARKERS: &[&str] = &[
+    "remix",
+    "live",
+    "acoustic",
+    "instrumental",
+    "acappella",
+    "acapella",
+    "cappella",
+    "karaoke",
+    "cover",
+    "demo",
+    "parody",
+    "extended",
+    "sped",
+    "slowed",
+    "nightcore",
+    "reverb",
+    "orchestral",
+    "8d",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LyricsTiming {
@@ -164,6 +187,9 @@ impl LyricsClient {
             self.fetch_lrclib(&track)
         );
         let candidates = [
+            // Order is the tie-break: on equal timing, the first provider that
+            // returned lyrics wins, so Apple's label timing is preferred over
+            // the aggregated mirrors.
             bini.as_ref().ok(),
             kpoe.as_ref().ok(),
             unison.as_ref().ok(),
@@ -361,29 +387,33 @@ impl LyricsClient {
             .duration
             .map(|duration| duration.to_string())
             .unwrap_or_default();
+        // Deliberately no album: passing one makes the server pick a different
+        // source, which for some tracks returns a variant that reads the
+        // songwriter credits out as lyrics. Title and artist are enough for it
+        // to find the song on its own.
         let mut query = vec![
             ("title", terms.title.as_str()),
             ("artist", terms.artist.as_str()),
         ];
-        if let Some(album) = terms.album.as_deref() {
-            query.push(("album", album));
-        }
         if !duration.is_empty() {
             query.push(("duration", duration.as_str()));
         }
 
         let mut last_error = None;
         for (index, mirror) in KPOE_MIRRORS.iter().enumerate() {
-            match self.kpoe_request(mirror, "/v1/ttml/get", &query).await {
+            // The JSON endpoint is the maintained one and is the only endpoint
+            // that reports which source it settled on. The TTML endpoint can
+            // serve a different, lower-quality variant of the same track, which
+            // renders songwriter credits as timed lyric lines, so it is only a
+            // fallback.
+            match self.kpoe_request(mirror, "/v2/lyrics/get", &query).await {
                 Ok(Some(lyrics)) => return Ok(Some(lyrics)),
                 Ok(None) => {}
                 Err(error) => last_error = Some(error),
             }
 
-            // The first mirror is the maintained one, so it is also the only one
-            // worth a second ask for the JSON format.
             if index == 0
-                && let Ok(Some(lyrics)) = self.kpoe_request(mirror, "/v2/lyrics/get", &query).await
+                && let Ok(Some(lyrics)) = self.kpoe_request(mirror, "/v1/ttml/get", &query).await
             {
                 return Ok(Some(lyrics));
             }
@@ -932,18 +962,35 @@ fn trim_separators(value: &str) -> &str {
         .trim()
 }
 
+fn version_markers(title: &str) -> Vec<&'static str> {
+    let words = tokens(title);
+    VERSION_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| words.iter().any(|word| word == marker))
+        .collect()
+}
+
 /// Scores a provider result against the search terms, or rejects it outright.
 /// Shared by BiniLyrics and LRCLIB so both rank candidates identically.
 fn match_score(
     terms: &SearchTerms,
-    title: &str,
+    candidate_title: &str,
     artist: &str,
     duration: Option<f64>,
 ) -> Option<u32> {
     let target_title = normalized_match_text(&terms.title);
-    let title = normalized_match_text(title);
+    let title = normalized_match_text(candidate_title);
     let target_artist = normalized_match_text(&terms.artist);
     let artist = normalized_match_text(artist);
+
+    let target_markers = version_markers(&terms.title);
+    if version_markers(candidate_title)
+        .into_iter()
+        .any(|marker| !target_markers.contains(&marker))
+    {
+        return None;
+    }
 
     // Title outweighs artist: a matching title with a `feat.` suffix on the
     // artist is still the same song, but a mismatched title is a different one.
@@ -969,13 +1016,17 @@ fn match_score(
         0
     };
 
+    // A music video is routinely a trimmed edit of the album track, so a loose
+    // duration still points at the right song. It only ranks, it never vetoes.
     let duration_score = match (terms.duration, duration) {
         (Some(target), Some(candidate)) if candidate > 0.0 => {
             let difference = (candidate - target).abs();
             if difference <= 3.0 {
                 5
             } else if difference <= 8.0 {
-                2
+                3
+            } else if difference <= f64::max(45.0, target * 0.2) {
+                1
             } else {
                 return None;
             }
@@ -1179,6 +1230,8 @@ fn parse_kpoe(response: KpoeResponse) -> Option<Lyrics> {
     });
     let source = if metadata.source.trim().is_empty() {
         "Lyrics+".to_owned()
+    } else if metadata.source.starts_with("Lyrics+") {
+        metadata.source.trim().to_owned()
     } else {
         format!("Lyrics+ ({})", metadata.source.trim())
     };
@@ -1827,6 +1880,55 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live lyrics provider compatibility probe"]
+    async fn prefers_apple_when_the_video_is_a_shortened_edit() {
+        // The official video runs 230s but Apple's master is 268s, so the
+        // duration gap must not disqualify the only real match.
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch(LyricsTrack {
+                title: "B.o.B - Nothin' On You (feat. Bruno Mars) [Official Video]".to_owned(),
+                artist: "B.o.B".to_owned(),
+                album: Some("B.o.B Presents: The Adventures of Bobby Ray".to_owned()),
+                duration_seconds: Some(230),
+                video_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(lyrics.source, "Apple (via BiniLyrics)");
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(
+            lyrics.lines[0].text, "Beautiful girls all over the world",
+            "songwriter credits must never be rendered as a lyric line"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
+    async fn lyrics_plus_serves_no_credit_lines_as_lyrics() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch_kpoe(&LyricsTrack {
+                title: "B.o.B - Nothin' On You (feat. Bruno Mars) [Official Video]".to_owned(),
+                artist: "B.o.B".to_owned(),
+                album: None,
+                duration_seconds: Some(263),
+                video_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !lyrics.lines.iter().any(|line| line.text.contains('/')),
+            "credit blocks are not lyrics: {:?}",
+            lyrics.lines.first().map(|line| &line.text)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
     async fn loads_syllable_synced_lyrics_from_live_unison() {
         let lyrics = LyricsClient::new()
             .unwrap()
@@ -1880,7 +1982,16 @@ mod tests {
         );
         assert_eq!(clean_title("Song [Official Lyric Video]", "X"), "Song");
         assert_eq!(clean_title("Song (feat. Someone)", "X"), "Song");
-        assert_eq!(clean_title("Song - Live", "X"), "Song");
+        assert_eq!(
+            clean_title("Song (Official Live Video)", "X"),
+            "Song",
+            "an 'official live video' marker is upload noise"
+        );
+        assert_eq!(
+            clean_title("Song - Live", "X"),
+            "Song - Live",
+            "a bare 'Live' marks a different recording and must survive"
+        );
         assert_eq!(clean_title("Song (M/V)", "X"), "Song");
     }
 
@@ -1936,8 +2047,66 @@ mod tests {
         let terms = SearchTerms::from_track(&track("Tahanan", "Adie", Some(196)));
         assert!(
             match_score(&terms, "Tahanan", "Adie feat. Someone", Some(196.0))
-                > match_score(&terms, "Tahanan Live", "Adie", Some(196.0))
+                > match_score(&terms, "Tahanan Na Naman", "Adie", Some(196.0))
         );
+    }
+
+    #[test]
+    fn rejects_a_credit_line_rendered_as_a_lyric() {
+        let terms = SearchTerms::from_track(&track(
+            "Nothin' on You (feat. Bruno Mars)",
+            "B.o.B",
+            Some(230),
+        ));
+
+        assert!(
+            match_score(
+                &terms,
+                "Ari Levine/Bobby Simmons Jr./Bruno Mars/Philip Lawrence",
+                "B.o.B",
+                Some(230.0)
+            )
+            .is_none(),
+            "songwriter credits are metadata, never a lyric line"
+        );
+    }
+
+    #[test]
+    fn rejects_versions_the_target_did_not_ask_for() {
+        let terms = SearchTerms::from_track(&track(
+            "Nothin' on You (feat. Bruno Mars)",
+            "B.o.B",
+            Some(230),
+        ));
+
+        for unwanted in [
+            "Nothin' on You (Acappella) [feat. Bruno Mars]",
+            "Nothin' On You (TC's Switch-Up Remix) [feat. Bruno Mars]",
+            "Nothin' On You (TC's Switch-Up Extended Version)",
+            "Nothin' on You (Karaoke Version)",
+        ] {
+            assert!(
+                match_score(&terms, unwanted, "B.o.B", Some(237.0)).is_none(),
+                "{unwanted} is a different recording"
+            );
+        }
+
+        assert!(
+            match_score(
+                &terms,
+                "Nothin' on You (feat. Bruno Mars)",
+                "B.o.B",
+                Some(268.0)
+            )
+            .is_some(),
+            "the album track still matches despite being 38s longer than the video"
+        );
+    }
+
+    #[test]
+    fn still_matches_a_version_the_target_does_ask_for() {
+        let terms = SearchTerms::from_track(&track("Nothin' on You (Live)", "B.o.B", Some(237)));
+        assert!(match_score(&terms, "Nothin' On You (Live)", "B.o.B", Some(237.0)).is_some());
     }
 
     #[test]
@@ -1947,7 +2116,7 @@ mod tests {
             &terms,
             vec![
                 lrclib_hit("Tahanan", "Adie feat. Someone", 196.0),
-                lrclib_hit("Tahanan Live", "Adie", 196.0),
+                lrclib_hit("Tahanan Na Naman", "Adie", 196.0),
             ],
         )
         .unwrap();

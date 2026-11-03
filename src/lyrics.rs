@@ -93,6 +93,76 @@ const VERSION_MARKERS: &[&str] = &[
     "8d",
 ];
 
+/// QQ Music prepends a credit block (writers, publishers, engineers) to the
+/// timed lyrics. These prefixes identify such a line even when it is not a
+/// slash-separated name list.
+const CREDIT_LABELS: &[&str] = &[
+    "lyrics by",
+    "lyric by",
+    "written by",
+    "words by",
+    "composed by",
+    "music by",
+    "produced by",
+    "arranged by",
+    "vocals by",
+    "vocals produced by",
+    "vocal produced by",
+    "background vocals",
+    "additional vocal",
+    "executive producer",
+    "mixing engineer",
+    "mastered by",
+    "recorded at",
+    "published by",
+    "repertoire owner",
+    "copyright",
+    "publisher",
+    "producer",
+    "composer",
+    "lyricist",
+    "作词",
+    "作曲",
+    "编曲",
+    "制作",
+    "监制",
+    "出品",
+    "发行",
+    "录音",
+    "混音",
+    "母带",
+];
+
+/// Studio and rights-holder wording that only appears in the credit block.
+/// Singular `studio` is deliberately absent: it reads like a lyric.
+const CREDIT_INDUSTRY_MARKERS: &[&str] = &[
+    "studios",
+    "mastering",
+    "recordings",
+    "publishing",
+    "copyright control",
+    "chappel",
+    "ltd",
+    "llc",
+    "inc.",
+];
+
+/// Words that make a short line read like a lyric rather than a person's name,
+/// so `Hold On` and `Dancing Queen` are not mistaken for credits.
+const NAME_STOPWORDS: &[&str] = &[
+    "a", "am", "an", "and", "any", "are", "as", "at", "baby", "be", "been", "both", "but", "by",
+    "can", "come", "could", "day", "did", "do", "does", "down", "each", "few", "for", "from",
+    "get", "give", "go", "got", "had", "has", "have", "he", "heart", "her", "hers", "hey", "him",
+    "his", "hold", "how", "i", "if", "in", "into", "is", "it", "its", "just", "know", "let",
+    "life", "love", "made", "make", "may", "me", "might", "mine", "more", "most", "must", "my",
+    "need", "night", "no", "not", "now", "of", "off", "oh", "on", "one", "only", "or", "other",
+    "our", "out", "over", "own", "said", "same", "say", "see", "seen", "shall", "she", "should",
+    "so", "some", "stay", "such", "take", "than", "that", "the", "their", "them", "then", "these",
+    "they", "this", "those", "three", "time", "to", "today", "tonight", "too", "two", "under",
+    "up", "us", "very", "wake", "want", "was", "we", "were", "what", "when", "where", "which",
+    "who", "why", "will", "with", "without", "world", "would", "yeah", "you", "your", "yours",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LyricsTiming {
     Plain,
@@ -406,14 +476,19 @@ impl LyricsClient {
             // serve a different, lower-quality variant of the same track, which
             // renders songwriter credits as timed lyric lines, so it is only a
             // fallback.
-            match self.kpoe_request(mirror, "/v2/lyrics/get", &query).await {
+            match self
+                .kpoe_request(mirror, "/v2/lyrics/get", &query, &terms)
+                .await
+            {
                 Ok(Some(lyrics)) => return Ok(Some(lyrics)),
                 Ok(None) => {}
                 Err(error) => last_error = Some(error),
             }
 
             if index == 0
-                && let Ok(Some(lyrics)) = self.kpoe_request(mirror, "/v1/ttml/get", &query).await
+                && let Ok(Some(lyrics)) = self
+                    .kpoe_request(mirror, "/v1/ttml/get", &query, &terms)
+                    .await
             {
                 return Ok(Some(lyrics));
             }
@@ -430,6 +505,7 @@ impl LyricsClient {
         mirror: &str,
         path: &str,
         query: &[(&str, &str)],
+        terms: &SearchTerms,
     ) -> Result<Option<Lyrics>, LyricsFetchError> {
         let url = format!("{mirror}{path}");
         let response = self
@@ -460,7 +536,7 @@ impl LyricsClient {
             }));
         }
 
-        Ok(parse_kpoe(response))
+        Ok(parse_kpoe(response, terms))
     }
 }
 
@@ -1137,10 +1213,168 @@ fn unison_sync_timing(sync_type: &str) -> Option<LyricsTiming> {
     }
 }
 
+/// Drops the metadata block QQ Music puts in front of the timed lyrics. It is a
+/// contiguous run at the start of the payload; the first real lyric ends it, so
+/// a credit-looking line later in the song is never touched.
+fn strip_leading_credits(
+    lines: &mut Vec<(u64, u64, String, Vec<LyricSyllable>)>,
+    terms: &SearchTerms,
+) {
+    const MAX_CREDIT_LINES: usize = 24;
+
+    let mut dropped = 0;
+    while dropped < lines.len() && dropped < MAX_CREDIT_LINES {
+        let next_start_ms = lines.get(dropped + 1).map(|line| line.0);
+        let (start_ms, end_ms, text, _) = &lines[dropped];
+        if !is_credit_line(text, terms, *start_ms, *end_ms, next_start_ms) {
+            break;
+        }
+        dropped += 1;
+    }
+
+    // An all-credit payload is still better than no lyrics at all.
+    if dropped < lines.len() {
+        lines.drain(..dropped);
+    }
+}
+
+fn is_credit_line(
+    text: &str,
+    terms: &SearchTerms,
+    start_ms: u64,
+    end_ms: u64,
+    next_start_ms: Option<u64>,
+) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return true;
+    }
+    let lowered = text.to_lowercase();
+    if CREDIT_LABELS.iter().any(|label| lowered.starts_with(label)) {
+        return true;
+    }
+    if text.contains(':') || text.contains('：') {
+        return true;
+    }
+    if is_slash_name_list(text) || is_title_artist_header(text, terms) {
+        return true;
+    }
+    if CREDIT_INDUSTRY_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return true;
+    }
+
+    if looks_like_person_name(text)
+        && normalized_match_text(text) != normalized_match_text(&terms.title)
+    {
+        let duration_ms = end_ms.saturating_sub(start_ms);
+        let gap_ms = next_start_ms.map(|next| next.saturating_sub(end_ms));
+        return duration_ms < 1_000 || gap_ms.is_some_and(|gap| gap > 5_000);
+    }
+
+    false
+}
+
+fn is_slash_name_list(text: &str) -> bool {
+    if !text.contains('/') {
+        return false;
+    }
+    let parts = text.split('/').map(str::trim).collect::<Vec<_>>();
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+        return false;
+    }
+    parts.iter().all(|part| {
+        let words = part.split_whitespace().collect::<Vec<_>>();
+        !words.is_empty() && words.len() <= 5 && words.iter().all(|word| is_name_word(word))
+    })
+}
+
+fn is_title_artist_header(text: &str, terms: &SearchTerms) -> bool {
+    let normalized = normalized_match_text(text);
+    let title = normalized_match_text(&terms.title);
+    if title.chars().count() < 3 || !normalized.starts_with(&title) {
+        return false;
+    }
+    if ![" - ", " – ", " — ", " | "]
+        .iter()
+        .any(|separator| text.contains(separator))
+    {
+        return false;
+    }
+    let artist = normalized_match_text(&terms.artist);
+    (!artist.is_empty() && normalized.contains(&artist)) || text.contains('(') || text.contains('[')
+}
+
+fn looks_like_person_name(text: &str) -> bool {
+    // Syllable reconstruction can leave punctuation-only tokens behind, as in
+    // `Juan " Saucy " Peña`; they are not part of the name.
+    let words = text
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .collect::<Vec<_>>();
+    if !(2..=4).contains(&words.len()) {
+        return false;
+    }
+    if !words.iter().all(|word| is_name_word(word)) {
+        return false;
+    }
+    if words
+        .iter()
+        .any(|word| NAME_STOPWORDS.contains(&bare_name_word(word).as_str()))
+    {
+        return false;
+    }
+    if !words.iter().any(|word| {
+        word.chars()
+            .filter(|character| character.is_alphabetic())
+            .count()
+            >= 2
+    }) {
+        return false;
+    }
+    !matches!(text.trim_end().chars().last(), Some('?' | '!' | ';' | ','))
+}
+
+fn is_name_word(word: &str) -> bool {
+    let core = word.trim_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '.' | ',' | '\'' | '"' | '“' | '”' | '‘' | '’' | '(' | ')' | '-'
+            )
+    });
+    if core.is_empty() {
+        return false;
+    }
+    if core
+        .chars()
+        .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
+    {
+        return true;
+    }
+    let mut characters = core.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    first.is_uppercase()
+        && characters.all(|character| {
+            character.is_alphabetic() || matches!(character, '.' | '\'' | '’' | '-')
+        })
+}
+
+fn bare_name_word(word: &str) -> String {
+    word.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_ascii_alphabetic())
+        .collect()
+}
+
 /// Parses the Lyrics+ v2 payload, which carries timings in milliseconds with
 /// `duration` rather than `end`. Syllables keep their own trailing space, which
 /// is what glues consecutive words back together.
-fn parse_kpoe(response: KpoeResponse) -> Option<Lyrics> {
+fn parse_kpoe(response: KpoeResponse, terms: &SearchTerms) -> Option<Lyrics> {
     let mut pending = response
         .lyrics
         .into_iter()
@@ -1194,6 +1428,7 @@ fn parse_kpoe(response: KpoeResponse) -> Option<Lyrics> {
     if pending.is_empty() {
         return None;
     }
+    strip_leading_credits(&mut pending, terms);
 
     let timing = if pending
         .iter()
@@ -1929,6 +2164,33 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live lyrics provider compatibility probe"]
+    async fn lyrics_plus_strips_a_bare_songwriter_credit() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch_kpoe(&LyricsTrack {
+                title: "The Script - Superheroes (Official Video)".to_owned(),
+                artist: "The Script".to_owned(),
+                album: None,
+                duration_seconds: Some(250),
+                video_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            lyrics.lines.first().map(|line| line.text.as_str()),
+            Some("All her life she has seen"),
+            "the QQ Music payload opens with a songwriter credit, not a lyric"
+        );
+        assert!(
+            !lyrics.lines.iter().any(|line| line.text == "James Barry"),
+            "songwriter credits are metadata, never lyric lines"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
     async fn loads_syllable_synced_lyrics_from_live_unison() {
         let lyrics = LyricsClient::new()
             .unwrap()
@@ -2158,26 +2420,53 @@ mod tests {
         }
     }
 
+    fn kpoe_line(time: u64, duration: u64, text: &str) -> KpoeLine {
+        KpoeLine {
+            time: Some(time),
+            duration: Some(duration),
+            text: text.to_owned(),
+            syllabus: Vec::new(),
+        }
+    }
+
+    fn kpoe_lyrics(lines: Vec<KpoeLine>, terms: &SearchTerms) -> Option<Lyrics> {
+        parse_kpoe(
+            KpoeResponse {
+                ttml: None,
+                timing: "Line".to_owned(),
+                metadata: Some(KpoeMetadata {
+                    source: "QQ Music".to_owned(),
+                    song_writers: Vec::new(),
+                }),
+                lyrics: lines,
+            },
+            terms,
+        )
+    }
+
     #[test]
     fn parses_word_synced_kpoe_payloads() {
-        let lyrics = parse_kpoe(KpoeResponse {
-            ttml: None,
-            timing: "Word".to_owned(),
-            metadata: Some(KpoeMetadata {
-                source: "Apple".to_owned(),
-                song_writers: vec!["GIMS".to_owned()],
-            }),
-            lyrics: vec![KpoeLine {
-                time: Some(907),
-                duration: Some(2991),
-                text: "Hotshot, running nonstop".to_owned(),
-                syllabus: vec![
-                    kpoe_syllable(907, 782, "Hotshot, "),
-                    kpoe_syllable(1689, 404, "running "),
-                    kpoe_syllable(2093, 155, "nonstop"),
-                ],
-            }],
-        })
+        let lyrics = parse_kpoe(
+            KpoeResponse {
+                ttml: None,
+                timing: "Word".to_owned(),
+                metadata: Some(KpoeMetadata {
+                    source: "Apple".to_owned(),
+                    song_writers: vec!["GIMS".to_owned()],
+                }),
+                lyrics: vec![KpoeLine {
+                    time: Some(907),
+                    duration: Some(2991),
+                    text: "Hotshot, running nonstop".to_owned(),
+                    syllabus: vec![
+                        kpoe_syllable(907, 782, "Hotshot, "),
+                        kpoe_syllable(1689, 404, "running "),
+                        kpoe_syllable(2093, 155, "nonstop"),
+                    ],
+                }],
+            },
+            &SearchTerms::from_track(&track("Hotshot", "GIMS", Some(240))),
+        )
         .unwrap();
 
         assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
@@ -2194,28 +2483,31 @@ mod tests {
 
     #[test]
     fn parses_line_only_kpoe_payloads() {
-        let lyrics = parse_kpoe(KpoeResponse {
-            ttml: None,
-            timing: "Line".to_owned(),
-            metadata: Some(KpoeMetadata {
-                source: "QQ Music".to_owned(),
-                song_writers: Vec::new(),
-            }),
-            lyrics: vec![
-                KpoeLine {
-                    time: Some(1_000),
-                    duration: Some(2_000),
-                    text: "First".to_owned(),
-                    syllabus: Vec::new(),
-                },
-                KpoeLine {
-                    time: Some(3_000),
-                    duration: Some(0),
-                    text: "Second".to_owned(),
-                    syllabus: Vec::new(),
-                },
-            ],
-        })
+        let lyrics = parse_kpoe(
+            KpoeResponse {
+                ttml: None,
+                timing: "Line".to_owned(),
+                metadata: Some(KpoeMetadata {
+                    source: "QQ Music".to_owned(),
+                    song_writers: Vec::new(),
+                }),
+                lyrics: vec![
+                    KpoeLine {
+                        time: Some(1_000),
+                        duration: Some(2_000),
+                        text: "First".to_owned(),
+                        syllabus: Vec::new(),
+                    },
+                    KpoeLine {
+                        time: Some(3_000),
+                        duration: Some(0),
+                        text: "Second".to_owned(),
+                        syllabus: Vec::new(),
+                    },
+                ],
+            },
+            &SearchTerms::from_track(&track("First", "Test", Some(10))),
+        )
         .unwrap();
 
         assert_eq!(lyrics.timing, LyricsTiming::LineSynced);
@@ -2229,14 +2521,162 @@ mod tests {
     }
 
     #[test]
+    fn strips_a_bare_name_credit_before_the_first_lyric() {
+        let terms = SearchTerms::from_track(&track("Superheroes", "The Script", Some(250)));
+        let lyrics = kpoe_lyrics(
+            vec![
+                kpoe_line(9_070, 2_475, "James Barry"),
+                kpoe_line(23_118, 2_628, "All her life she has seen"),
+                kpoe_line(25_747, 2_770, "Oh the meanest side of me"),
+            ],
+            &terms,
+        )
+        .unwrap();
+
+        assert_eq!(
+            lyrics.lines[0].text, "All her life she has seen",
+            "James Barry is a songwriter, not the opening lyric"
+        );
+        assert_eq!(lyrics.lines[0].start_ms, Some(23_118));
+        assert_eq!(lyrics.lines.len(), 2);
+    }
+
+    #[test]
+    fn strips_a_slash_list_and_a_credit_colon() {
+        let terms = SearchTerms::from_track(&track(
+            "Nothin' on You (feat. Bruno Mars)",
+            "B.o.B",
+            Some(230),
+        ));
+        let lyrics = kpoe_lyrics(
+            vec![
+                kpoe_line(
+                    1_599,
+                    1_439,
+                    "Ari Levine/Bobby Simmons Jr./Bruno Mars/Philip Lawrence",
+                ),
+                kpoe_line(4_477, 800, "Bruno Mars/B.o.B："),
+                kpoe_line(5_278, 1_641, "Beautiful girls"),
+            ],
+            &terms,
+        )
+        .unwrap();
+
+        assert_eq!(lyrics.lines.len(), 1);
+        assert_eq!(lyrics.lines[0].text, "Beautiful girls");
+    }
+
+    #[test]
+    fn strips_a_title_artist_header_and_writer_list() {
+        let terms = SearchTerms::from_track(&track("Perfect", "Ed Sheeran", Some(263)));
+        let lyrics = kpoe_lyrics(
+            vec![
+                kpoe_line(0, 880, "Perfect - Ed Sheeran (艾德·希兰)"),
+                kpoe_line(1_200, 560, "Ed Sheeran/Matthew Sheeran"),
+                kpoe_line(2_652, 5_836, "I found a love for me"),
+            ],
+            &terms,
+        )
+        .unwrap();
+
+        assert_eq!(lyrics.lines.len(), 1);
+        assert_eq!(lyrics.lines[0].text, "I found a love for me");
+    }
+
+    #[test]
+    fn recognizes_a_header_even_when_the_artist_string_is_longer() {
+        let terms = SearchTerms::from_track(&track(
+            "See You Again",
+            "Wiz Khalifa feat. Charlie Puth",
+            Some(230),
+        ));
+        let lyrics = kpoe_lyrics(
+            vec![
+                kpoe_line(
+                    0,
+                    1_830,
+                    "See You Again - Wiz Khalifa (维兹·卡利法)/Charlie Puth (查理·普斯)",
+                ),
+                kpoe_line(2_066, 1_593, "Andrew Cedar/Cameron Thomaz/Charlie Puth"),
+                kpoe_line(10_993, 6_716, "It's been a long day without you my friend"),
+            ],
+            &terms,
+        )
+        .unwrap();
+
+        assert_eq!(lyrics.lines.len(), 1);
+        assert_eq!(
+            lyrics.lines[0].text,
+            "It's been a long day without you my friend"
+        );
+    }
+
+    #[test]
+    fn keeps_a_short_name_like_line_when_it_flows_into_the_next_lyric() {
+        let terms = SearchTerms::from_track(&track("Summer Night", "Test", Some(200)));
+        let lyrics = kpoe_lyrics(
+            vec![
+                kpoe_line(1_000, 2_000, "Mamma Mia"),
+                kpoe_line(3_500, 2_000, "Here we go again"),
+            ],
+            &terms,
+        )
+        .unwrap();
+
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(
+            lyrics.lines[0].text, "Mamma Mia",
+            "a normal-length opening line is not a credit"
+        );
+    }
+
+    #[test]
+    fn keeps_a_credit_looking_line_after_the_first_lyric() {
+        let terms = SearchTerms::from_track(&track("Superheroes", "The Script", Some(250)));
+        let lyrics = kpoe_lyrics(
+            vec![
+                kpoe_line(23_118, 2_628, "All her life she has seen"),
+                kpoe_line(60_000, 2_000, "James Barry"),
+            ],
+            &terms,
+        )
+        .unwrap();
+
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[1].text, "James Barry");
+    }
+
+    #[test]
+    fn does_not_empty_an_all_credit_payload() {
+        let terms = SearchTerms::from_track(&track("Superheroes", "The Script", Some(250)));
+        let lyrics = kpoe_lyrics(
+            vec![
+                kpoe_line(1_000, 500, "James Barry"),
+                kpoe_line(2_000, 500, "Ryan Tedder"),
+            ],
+            &terms,
+        )
+        .unwrap();
+
+        assert_eq!(
+            lyrics.lines.len(),
+            2,
+            "an all-credit payload is kept rather than returning no lyrics"
+        );
+    }
+
+    #[test]
     fn rejects_empty_kpoe_payloads() {
         assert!(
-            parse_kpoe(KpoeResponse {
-                ttml: None,
-                timing: "Line".to_owned(),
-                metadata: None,
-                lyrics: Vec::new(),
-            })
+            parse_kpoe(
+                KpoeResponse {
+                    ttml: None,
+                    timing: "Line".to_owned(),
+                    metadata: None,
+                    lyrics: Vec::new(),
+                },
+                &SearchTerms::from_track(&track("First", "Test", Some(10)))
+            )
             .is_none()
         );
     }

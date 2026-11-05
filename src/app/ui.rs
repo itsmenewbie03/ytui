@@ -899,7 +899,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(match (self.player_tab, self.up_next_move) {
                 (0, _) => {
-                    " h/l or Tab: section  j/k: scroll  Space: pause  [/] seek  c: copy link  Esc/P: back  q: quit "
+                    " h/l or Tab: section  j/k: scroll  r: refresh lyrics  Space: pause  [/] seek  c: copy link  Esc/P: back  q: quit "
                 }
                 (1, true) => {
                     " MOVE MODE  j/k: move  v, Enter, or Esc: keep  h/l or Tab: section  q: quit "
@@ -1210,7 +1210,13 @@ impl App {
             return;
         }
         if let Some(error) = &self.lyrics_error {
-            render_player_empty_state(frame, area, "Lyrics unavailable", error, Color::Red);
+            render_player_empty_state(
+                frame,
+                area,
+                "Lyrics unavailable",
+                &format!("{error}  ·  Press r to retry"),
+                Color::Red,
+            );
             return;
         }
         let Some(lyrics) = &self.lyrics else {
@@ -1218,7 +1224,7 @@ impl App {
                 frame,
                 area,
                 "Lyrics unavailable",
-                "No matching lyrics were found for this track.",
+                "No matching lyrics were found for this track.  ·  Press r to retry",
                 accent,
             );
             return;

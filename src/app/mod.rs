@@ -453,6 +453,7 @@ impl App {
                             });
                             self.lyrics_scroll = (self.lyrics_scroll + 1).min(last);
                         }
+                        KeyCode::Char('r') if self.player_tab == 0 => self.refresh_lyrics(),
                         KeyCode::Enter if self.player_tab == 1 => self.play_selected_up_next(),
                         KeyCode::Char('v') if self.player_tab == 1 => {
                             self.toggle_up_next_move_mode();
@@ -1584,6 +1585,17 @@ impl App {
         });
         self.lyrics_receiver = Some(receiver);
         self.lyrics_loading = true;
+    }
+
+    fn refresh_lyrics(&mut self) {
+        if self.lyrics_loading {
+            return;
+        }
+        let Some(track) = self.playback.track.clone() else {
+            self.notification = Some(Notification::info("Lyrics", "Nothing is playing."));
+            return;
+        };
+        self.request_lyrics(&track);
     }
 
     fn toggle_pause(&mut self) {

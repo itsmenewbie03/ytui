@@ -124,9 +124,9 @@ Open **Settings**, select **SponsorBlock** under **Playback**, and enable the se
 
 ### 🎤 Lyrics
 
-When a track starts, ytui searches [BiniLyrics](https://lyrics-api.binimum.org/), [Lyrics+](https://lyricsplus.prjktla.my.id), [Unison](https://unison.boidu.dev/), and [LRCLIB](https://lrclib.net/) using its title, artist, and any available album and duration metadata; Unison is also queried by the current YouTube video ID for exact matches.
+When a track starts, ytui searches [BiniLyrics](https://lyrics-api.binimum.org/), [Lyrics+](https://lyricsplus.prjktla.my.id), [Unison](https://unison.boidu.dev/), [SimpMusic](https://lyrics.simpmusic.org/), [LRCLIB](https://lrclib.net/), and [Luna](https://music.douyin.com/) using its title, artist, and any available album and duration metadata; Unison is also queried by the current YouTube video ID for exact matches, and SimpMusic is queried only by that video ID.
 
-Upload noise is stripped before searching, so titles like `GIMS - Est-ce que tu m'aimes ? (Clip officiel)` are matched as `Est-ce que tu m'aimes ?`. When LRCLIB's exact-match lookup misses, its fuzzy search is used to find the closest track. Lyrics+ aggregates Apple Music, QQ Music, Musixmatch, and Spotify, so most word-synced lyrics come from there; it has no fixed host, so ytui tries each mirror in turn. YouTube account cookies are never sent to any of these services. The Lyrics tab prefers syllable-synced lyrics, then line-synced lyrics, and finally plain text; songwriter and provider attribution appears after the lyrics when available.
+Upload noise is stripped before searching, so titles like `GIMS - Est-ce que tu m'aimes ? (Clip officiel)` are matched as `Est-ce que tu m'aimes ?`. When LRCLIB's exact-match lookup misses, its fuzzy search is used to find the closest track. Lyrics+ aggregates Apple Music, QQ Music, Musixmatch, and Spotify, so most word-synced lyrics come from there; it has no fixed host, so ytui tries each mirror in turn. SimpMusic contributes community-submitted word-synced lyrics keyed to the exact video, including overlapping vocal timing. Luna contributes word-synced KRC timings, especially for Chinese and Korean tracks; because its catalog includes many covers and karaoke uploads, candidates must match the artist and duration closely. YouTube account cookies are never sent to any of these services. The Lyrics tab prefers syllable-synced lyrics, then line-synced lyrics, and finally plain text; songwriter and provider attribution appears after the lyrics when available. Press `r` on the Lyrics tab to retry the search for the current track.
 
 ### 🎶 Playlist Playback
 
@@ -158,6 +158,7 @@ In Settings, use `j` / `k` to select an option, `h` / `l` to change it, `Enter` 
 | `[` / `]` | Seek backward or forward 10 seconds |
 | `p` / `n` | Play the previous or next queue item |
 | `c` | Copy the current song's YouTube link |
+| `r` | Refresh lyrics on the Lyrics tab |
 | `h` / `l`, `Tab` / `Shift+Tab` | Change full-player tab |
 
 ### 🔀 Up Next

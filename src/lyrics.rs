@@ -13,6 +13,14 @@ const KPOE_MIRRORS: &[&str] = &[
     "https://lyricsplus.binimum.org",
     "https://lyricsplus.prjktla.workers.dev",
 ];
+const LUNA_SEARCH_URL: &str = "https://api.qishui.com/luna/search/track";
+const LUNA_DETAIL_URL: &str = "https://beta-luna.douyin.com/luna/h5/seo_track";
+const LUNA_SEARCH_UA: &str = "com.luna.music/100198030 (Linux; U; Android 15; zh_CN_#Hans; ABR-AL80; Build/V417IR;tt-ok/3.12.13.19)";
+const LUNA_WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const LUNA_MAX_CANDIDATES: usize = 3;
+const SIMPMUSIC_URL: &str = "https://api-lyrics.simpmusic.org/v1";
+const SIMPMUSIC_UA: &str = "SimpMusicLyrics/1.0";
+const SIMPMUSIC_LAST_WORD_MS: u64 = 800;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Title tokens that describe the *upload* rather than the song. A bracketed
@@ -250,40 +258,59 @@ impl LyricsClient {
     }
 
     pub async fn fetch(&self, track: LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
-        let (bini, kpoe, unison, lrclib) = tokio::join!(
+        let (bini, kpoe, unison, simpmusic, lrclib, luna) = tokio::join!(
             self.fetch_binilyrics(&track),
             self.fetch_kpoe(&track),
             self.fetch_unison(&track),
-            self.fetch_lrclib(&track)
+            self.fetch_simpmusic(&track),
+            self.fetch_lrclib(&track),
+            async {
+                // Luna is an undocumented mobile API and is allowed to be slow.
+                // The overall timeout keeps a bad day there from delaying the
+                // aggregate lookup indefinitely.
+                match tokio::time::timeout(Duration::from_secs(5), self.fetch_luna(&track)).await {
+                    Ok(result) => result,
+                    Err(_) => Ok(None),
+                }
+            }
         );
-        let candidates = [
+        let results = [bini, kpoe, unison, simpmusic, lrclib, luna];
+        let candidates = results
+            .iter()
             // Order is the tie-break: on equal timing, the first provider that
             // returned lyrics wins, so Apple's label timing is preferred over
             // the aggregated mirrors.
-            bini.as_ref().ok(),
-            kpoe.as_ref().ok(),
-            unison.as_ref().ok(),
-            lrclib.as_ref().ok(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|lyrics| lyrics.clone())
-        .collect::<Vec<_>>();
+            .filter_map(|result| {
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|lyrics| lyrics.as_ref())
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
 
         if let Some(lyrics) = Lyrics::best_available(candidates) {
             return Ok(Some(lyrics));
         }
 
-        match (bini, kpoe, unison, lrclib) {
-            (Err(bini), Err(kpoe), Err(unison), Err(lrclib)) => Err(LyricsFetchError(format!(
-                "lyrics providers failed: {bini}; {kpoe}; {unison}; {lrclib}"
-            ))),
-            (Err(error), Ok(None), Ok(None), Ok(None)) => Err(error),
-            (Ok(None), Err(error), Ok(None), Ok(None)) => Err(error),
-            (Ok(None), Ok(None), Err(error), Ok(None)) => Err(error),
-            (Ok(None), Ok(None), Ok(None), Err(error)) => Err(error),
-            _ => Ok(None),
+        let errors = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect::<Vec<_>>();
+        if errors.len() == results.len() {
+            return Err(LyricsFetchError(format!(
+                "lyrics providers failed: {}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
         }
+        if let [error] = errors.as_slice() {
+            return Err(LyricsFetchError(error.to_string()));
+        }
+        Ok(None)
     }
 
     async fn fetch_binilyrics(
@@ -538,6 +565,135 @@ impl LyricsClient {
 
         Ok(parse_kpoe(response, terms))
     }
+
+    /// SimpMusic stores community-submitted lyrics keyed by the exact YouTube
+    /// video ID. Unlike the search-based providers it has no title fallback, so
+    /// a missing video ID means there is nothing to ask for.
+    async fn fetch_simpmusic(
+        &self,
+        track: &LyricsTrack,
+    ) -> Result<Option<Lyrics>, LyricsFetchError> {
+        let Some(video_id) = track.video_id.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if !valid_youtube_video_id(video_id) {
+            return Ok(None);
+        }
+
+        let url = format!("{SIMPMUSIC_URL}/{video_id}");
+        let response = self
+            .client
+            .get(&url)
+            .header("User-Agent", SIMPMUSIC_UA)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(provider_error("SimpMusic"))?;
+        let Some(body) = response_body(response, "SimpMusic").await? else {
+            return Ok(None);
+        };
+        let response: SimpMusicResponse = serde_json::from_slice(&body)
+            .map_err(|error| LyricsFetchError(format!("invalid SimpMusic response: {error}")))?;
+        if !response.success {
+            return Ok(None);
+        }
+
+        Ok(parse_simpmusic(response))
+    }
+
+    /// Luna (Qishui/Douyin) is a mobile music service whose web endpoint serves
+    /// KRC word timing. Its catalog is UGC-heavy, so candidates are matched
+    /// strictly before any lyrics detail is requested.
+    async fn fetch_luna(&self, track: &LyricsTrack) -> Result<Option<Lyrics>, LyricsFetchError> {
+        let terms = SearchTerms::from_track(track);
+        let keyword = format!("{} {}", terms.artist, terms.title);
+        let keyword = keyword.trim();
+        let response = self
+            .client
+            .get(LUNA_SEARCH_URL)
+            .query(&[
+                ("device_platform", "android"),
+                ("os", "android"),
+                ("ssmix", "a"),
+                ("cdid", "46556f98-1720-4248-83da-62b74b60b46a"),
+                ("channel", "xiaomi_8478_64"),
+                ("aid", "386088"),
+                ("app_name", "luna"),
+                ("version_code", "100198030"),
+                ("version_name", "19.8.0"),
+                ("manifest_version_code", "100198030"),
+                ("update_version_code", "100198030"),
+                ("resolution", "1080*1920"),
+                ("dpi", "480"),
+                ("device_type", "ABR-AL80"),
+                ("device_brand", "HUAWEI"),
+                ("language", "en"),
+                ("os_api", "35"),
+                ("os_version", "15"),
+                ("ac", "wifi"),
+                ("device_model", "ABR-AL80"),
+                ("tz_name", "Asia/Shanghai"),
+                ("tz_offset", "28800"),
+                ("package", "com.luna.music"),
+                ("sim_region", "cn"),
+                ("q", keyword),
+                ("cursor", "0"),
+                ("count", "20"),
+            ])
+            .header("User-Agent", LUNA_SEARCH_UA)
+            .header("Accept", "*/*")
+            .send()
+            .await
+            .map_err(provider_error("Luna search"))?;
+        let Some(body) = response_body(response, "Luna search").await? else {
+            return Ok(None);
+        };
+        let response: LunaSearchResponse = serde_json::from_slice(&body)
+            .map_err(|error| LyricsFetchError(format!("invalid Luna search response: {error}")))?;
+        let candidates = luna_candidates(&terms, response);
+
+        let mut last_error = None;
+        for (index, candidate) in candidates.iter().take(LUNA_MAX_CANDIDATES).enumerate() {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            match self.fetch_luna_lyrics(candidate, &terms).await {
+                Ok(Some(lyrics)) => return Ok(Some(lyrics)),
+                Ok(None) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    async fn fetch_luna_lyrics(
+        &self,
+        candidate: &LunaCandidate,
+        terms: &SearchTerms,
+    ) -> Result<Option<Lyrics>, LyricsFetchError> {
+        let response = self
+            .client
+            .get(LUNA_DETAIL_URL)
+            .query(&[
+                ("track_id", candidate.id.as_str()),
+                ("device_platform", "web"),
+            ])
+            .header("User-Agent", LUNA_WEB_UA)
+            .header("Accept", "*/*")
+            .send()
+            .await
+            .map_err(provider_error("Luna lyrics"))?;
+        let Some(body) = response_body(response, "Luna lyrics").await? else {
+            return Ok(None);
+        };
+        let response: LunaDetailResponse = serde_json::from_slice(&body)
+            .map_err(|error| LyricsFetchError(format!("invalid Luna lyrics response: {error}")))?;
+        Ok(parse_luna(response, terms))
+    }
 }
 
 impl Lyrics {
@@ -748,6 +904,121 @@ struct UnisonData {
     lyrics: String,
 }
 
+#[derive(Deserialize)]
+struct LunaSearchResponse {
+    #[serde(default)]
+    result_groups: Vec<LunaResultGroup>,
+}
+
+#[derive(Deserialize)]
+struct LunaResultGroup {
+    #[serde(default)]
+    data: Vec<LunaSearchItem>,
+}
+
+#[derive(Deserialize)]
+struct LunaSearchItem {
+    #[serde(default)]
+    entity: Option<LunaEntity>,
+}
+
+#[derive(Deserialize)]
+struct LunaEntity {
+    #[serde(default)]
+    track: Option<LunaTrack>,
+}
+
+#[derive(Deserialize)]
+struct LunaDetailResponse {
+    #[serde(default)]
+    lyric: Option<LunaLyric>,
+    #[serde(default)]
+    seo_track: Option<LunaSeoTrack>,
+}
+
+#[derive(Deserialize)]
+struct LunaSeoTrack {
+    #[serde(default)]
+    track: Option<LunaTrack>,
+}
+
+#[derive(Deserialize)]
+struct LunaLyric {
+    #[serde(default)]
+    content: String,
+    #[serde(default, rename = "type")]
+    kind: String,
+}
+
+#[derive(Deserialize)]
+struct LunaTrack {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    artists: Vec<LunaArtist>,
+    #[serde(default)]
+    duration: u64,
+    #[serde(default)]
+    label_info: Option<LunaLabelInfo>,
+    #[serde(default)]
+    song_maker_team: Option<LunaSongMakerTeam>,
+}
+
+#[derive(Deserialize)]
+struct LunaArtist {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct LunaLabelInfo {
+    #[serde(default)]
+    is_original: bool,
+}
+
+#[derive(Deserialize)]
+struct LunaSongMakerTeam {
+    #[serde(default)]
+    composers: Vec<LunaCredit>,
+    #[serde(default)]
+    lyricists: Vec<LunaCredit>,
+}
+
+#[derive(Deserialize)]
+struct LunaCredit {
+    #[serde(default)]
+    name: String,
+}
+
+struct LunaCandidate {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct SimpMusicResponse {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    data: Option<Vec<SimpMusicEntry>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimpMusicEntry {
+    #[serde(default)]
+    vote: Option<i64>,
+    #[serde(default)]
+    contributor: Option<String>,
+    #[serde(default)]
+    rich_sync_lyrics: Option<String>,
+    #[serde(default)]
+    synced_lyrics: Option<String>,
+    #[serde(default)]
+    plain_lyric: Option<String>,
+}
+
 async fn response_body(
     mut response: reqwest::Response,
     provider: &str,
@@ -798,8 +1069,55 @@ fn allowed_provider_url(url: &reqwest::Url) -> bool {
                     | "lyricsplus.prjktla.my.id"
                     | "lyricsplus.binimum.org"
                     | "lyricsplus.prjktla.workers.dev"
+                    | "api.qishui.com"
+                    | "beta-luna.douyin.com"
+                    | "api-lyrics.simpmusic.org"
             )
         )
+}
+
+/// Ranks Luna search hits before any detail request. Luna returns a lot of
+/// covers and karaoke uploads, so only candidates that pass the shared match
+/// rules are kept; originals win ties.
+fn luna_candidates(terms: &SearchTerms, response: LunaSearchResponse) -> Vec<LunaCandidate> {
+    let mut candidates = Vec::new();
+    for group in response.result_groups {
+        for item in group.data {
+            let Some(track) = item.entity.and_then(|entity| entity.track) else {
+                continue;
+            };
+            if track.id.is_empty() || track.name.is_empty() {
+                continue;
+            }
+            if candidates
+                .iter()
+                .any(|(_, _, candidate): &(u32, bool, LunaCandidate)| candidate.id == track.id)
+            {
+                continue;
+            }
+            let artist = track
+                .artists
+                .iter()
+                .map(|artist| artist.name.trim())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let duration = (track.duration > 0).then_some(track.duration as f64 / 1_000.0);
+            let Some(score) = match_score(terms, &track.name, &artist, duration) else {
+                continue;
+            };
+            let original = track
+                .label_info
+                .as_ref()
+                .is_some_and(|label| label.is_original);
+            candidates.push((score, original, LunaCandidate { id: track.id }));
+        }
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    candidates
+        .into_iter()
+        .map(|(_, _, candidate)| candidate)
+        .collect()
 }
 
 fn best_bini_match(
@@ -1048,7 +1366,7 @@ fn version_markers(title: &str) -> Vec<&'static str> {
 }
 
 /// Scores a provider result against the search terms, or rejects it outright.
-/// Shared by BiniLyrics and LRCLIB so both rank candidates identically.
+/// Shared by every provider so candidates rank identically.
 fn match_score(
     terms: &SearchTerms,
     candidate_title: &str,
@@ -1067,18 +1385,6 @@ fn match_score(
     {
         return None;
     }
-
-    // Title outweighs artist: a matching title with a `feat.` suffix on the
-    // artist is still the same song, but a mismatched title is a different one.
-    let title_score = if target_title.is_empty() || title.is_empty() {
-        0
-    } else if target_title == title {
-        20
-    } else if target_title.contains(&title) || title.contains(&target_title) {
-        10
-    } else {
-        return None;
-    };
 
     let artist_score = if target_artist.is_empty() || artist.is_empty() {
         0
@@ -1110,7 +1416,68 @@ fn match_score(
         _ => 0,
     };
 
+    // Title outweighs artist: a matching title with a `feat.` suffix on the
+    // artist is still the same song, but a mismatched title is a different one.
+    let title_score = if target_title.is_empty() || title.is_empty() {
+        0
+    } else if target_title == title {
+        20
+    } else if target_title.contains(&title) || title.contains(&target_title) {
+        10
+    } else if artist_score >= 10
+        && duration_score >= 1
+        && titles_differ_by_one_edit(&target_title, &title)
+    {
+        // Providers spell elided titles differently (`Nothin'` vs `Nothing`).
+        // Requiring a known artist and a plausible duration keeps this from
+        // turning into a loose match.
+        8
+    } else {
+        return None;
+    };
+
     Some(title_score + artist_score + duration_score)
+}
+
+/// Whether two normalized titles differ by at most one inserted, deleted, or
+/// substituted character. Short titles are excluded so `Sing` and `Sin` are
+/// never treated as the same song.
+fn titles_differ_by_one_edit(left: &str, right: &str) -> bool {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().min(right.len()) < 5 || left.len().abs_diff(right.len()) > 1 {
+        return false;
+    }
+    if left.first() != right.first() {
+        return false;
+    }
+
+    let (shorter, longer) = if left.len() <= right.len() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    let mut short_index = 0;
+    let mut long_index = 0;
+    let mut edits = 0;
+    while short_index < shorter.len() && long_index < longer.len() {
+        if shorter[short_index] == longer[long_index] {
+            short_index += 1;
+            long_index += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+            if shorter.len() == longer.len() {
+                short_index += 1;
+                long_index += 1;
+            } else {
+                long_index += 1;
+            }
+        }
+    }
+    edits + (shorter.len() - short_index) + (longer.len() - long_index) <= 1
 }
 
 fn parse_lrclib(response: LrcLibResponse) -> Option<Lyrics> {
@@ -1479,6 +1846,717 @@ fn parse_kpoe(response: KpoeResponse, terms: &SearchTerms) -> Option<Lyrics> {
     })
 }
 
+fn parse_luna(response: LunaDetailResponse, terms: &SearchTerms) -> Option<Lyrics> {
+    let lyric = response.lyric?;
+    let content = lyric.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    let kind = lyric.kind.to_ascii_lowercase();
+    let (mut timing, mut lines) = if kind == "krc" {
+        if let Some(lines) = parse_krc(content) {
+            (LyricsTiming::SyllableSynced, lines)
+        } else if let Some(lines) = parse_lrc(content) {
+            (LyricsTiming::LineSynced, lines)
+        } else {
+            (LyricsTiming::Plain, parse_plain_lyrics(content)?)
+        }
+    } else if let Some(lines) = parse_lrc(content) {
+        (LyricsTiming::LineSynced, lines)
+    } else {
+        (LyricsTiming::Plain, parse_plain_lyrics(content)?)
+    };
+
+    if lines.iter().any(|line| !line.syllables.is_empty()) {
+        timing = LyricsTiming::SyllableSynced;
+    } else if timing == LyricsTiming::SyllableSynced {
+        timing = LyricsTiming::LineSynced;
+    }
+
+    strip_leading_credits_from_lines(&mut lines, terms);
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(Lyrics {
+        timing,
+        lines,
+        source: "Luna".to_owned(),
+        songwriters: luna_songwriters(response.seo_track),
+    })
+}
+
+/// Parses SimpMusic's JSON payload. Entries are community submissions, so the
+/// highest-voted one wins; within an entry the richest available timing is used.
+fn parse_simpmusic(response: SimpMusicResponse) -> Option<Lyrics> {
+    let entries = response.data?;
+    let mut best: Option<(i64, Lyrics)> = None;
+    for entry in entries {
+        let vote = entry.vote.unwrap_or(0);
+        let Some(lyrics) = parse_simpmusic_entry(entry) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(best_vote, _)| vote > *best_vote) {
+            best = Some((vote, lyrics));
+        }
+    }
+    best.map(|(_, lyrics)| lyrics)
+}
+
+fn parse_simpmusic_entry(entry: SimpMusicEntry) -> Option<Lyrics> {
+    let contributor = entry
+        .contributor
+        .as_deref()
+        .map(str::trim)
+        .filter(|contributor| !contributor.is_empty());
+    let source = contributor.map_or_else(
+        || "SimpMusic".to_owned(),
+        |contributor| format!("SimpMusic (submitted by {contributor})"),
+    );
+
+    let mut parsed = None;
+    for document in [entry.rich_sync_lyrics, entry.synced_lyrics] {
+        let Some(document) = document else {
+            continue;
+        };
+        if document.trim().is_empty() {
+            continue;
+        }
+        if let Some(lines) = parse_simpmusic_lrc(&document) {
+            let timing = if lines.iter().any(|line| !line.syllables.is_empty()) {
+                LyricsTiming::SyllableSynced
+            } else {
+                LyricsTiming::LineSynced
+            };
+            parsed = Some((timing, lines));
+            break;
+        }
+    }
+
+    if parsed.is_none()
+        && let Some(document) = entry.plain_lyric
+        && let Some(lines) = parse_simpmusic_plain(&document)
+    {
+        parsed = Some((LyricsTiming::Plain, lines));
+    }
+
+    parsed.map(|(timing, lines)| Lyrics {
+        timing,
+        lines,
+        source,
+        songwriters: Vec::new(),
+    })
+}
+
+/// Parses SimpMusic's LRC payload, including its `[offset:seconds]` tag and the
+/// `<mm:ss.xx>` word markers used by rich sync. Section-only lines are dropped.
+fn parse_simpmusic_lrc(document: &str) -> Option<Vec<LyricLine>> {
+    let offset_ms = simpmusic_offset(document);
+    let mut lines = Vec::new();
+
+    for raw_line in document.lines() {
+        let raw_line = raw_line.trim();
+        if raw_line.is_empty() {
+            continue;
+        }
+        let (timestamps, body) = split_lrc_tags(raw_line);
+        if timestamps.is_empty() {
+            continue;
+        }
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+
+        for timestamp in timestamps {
+            let start_ms = adjust_simpmusic_time(timestamp, offset_ms);
+            let (text, syllables) = parse_simpmusic_body(body, start_ms, offset_ms);
+            if is_break_marker(&text) || is_section_label(&text) {
+                continue;
+            }
+            let start_ms = syllables
+                .iter()
+                .map(|syllable| syllable.start_ms)
+                .min()
+                .map_or(start_ms, |first| first.min(start_ms));
+            let end_ms = syllables.iter().map(|syllable| syllable.end_ms).max();
+            lines.push(LyricLine {
+                text,
+                start_ms: Some(start_ms),
+                end_ms,
+                syllables,
+            });
+        }
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    lines.sort_by_key(|line| line.start_ms.unwrap_or(0));
+    for index in 0..lines.len() {
+        let start_ms = lines[index].start_ms.unwrap_or(0);
+        let end_ms = lines[index].end_ms.unwrap_or_else(|| {
+            lines
+                .get(index + 1)
+                .and_then(|line| line.start_ms)
+                .unwrap_or_else(|| start_ms.saturating_add(5_000))
+        });
+        lines[index].end_ms = Some(end_ms.max(start_ms));
+    }
+
+    Some(lines)
+}
+
+fn parse_simpmusic_body(
+    body: &str,
+    line_start_ms: u64,
+    offset_ms: i64,
+) -> (String, Vec<LyricSyllable>) {
+    let markers = simpmusic_markers(body);
+    if markers.is_empty() {
+        return (
+            normalize_lyric_text(&decode_html_entities(body)),
+            Vec::new(),
+        );
+    }
+
+    let mut raw_words = Vec::new();
+    let prefix = &body[..markers[0].0];
+    if !prefix.trim().is_empty() {
+        raw_words.push((line_start_ms, prefix));
+    }
+    for (index, &(_, marker_end, timestamp)) in markers.iter().enumerate() {
+        let raw_end = markers.get(index + 1).map_or(body.len(), |next| next.0);
+        raw_words.push((
+            adjust_simpmusic_time(timestamp, offset_ms),
+            &body[marker_end..raw_end],
+        ));
+    }
+
+    let decoded_words = raw_words
+        .into_iter()
+        .map(|(start_ms, raw)| (start_ms, decode_html_entities(raw)))
+        .collect::<Vec<_>>();
+
+    let mut syllables: Vec<LyricSyllable> = Vec::new();
+    let mut trailing_marker = None;
+    for (index, (start_ms, raw)) in decoded_words.iter().enumerate() {
+        let text = normalize_lyric_text(raw);
+        if text.is_empty() {
+            if let Some(last) = syllables.last_mut()
+                && !last.tail.ends_with(' ')
+            {
+                last.tail.push(' ');
+            }
+            if index + 1 == decoded_words.len() {
+                trailing_marker = Some(*start_ms);
+            }
+            continue;
+        }
+
+        let trailing_space = raw.chars().last().is_some_and(char::is_whitespace);
+        let next_leading_space = decoded_words
+            .get(index + 1)
+            .is_some_and(|(_, next)| next.chars().next().is_some_and(char::is_whitespace));
+        let tail = if trailing_space || next_leading_space {
+            " "
+        } else {
+            ""
+        };
+        syllables.push(LyricSyllable {
+            text,
+            tail: tail.to_owned(),
+            start_ms: *start_ms,
+            end_ms: *start_ms,
+        });
+    }
+
+    for index in 0..syllables.len() {
+        let start_ms = syllables[index].start_ms;
+        if let Some(next) = syllables.get(index + 1) {
+            syllables[index].end_ms = next.start_ms.max(start_ms);
+        } else {
+            let end_ms = trailing_marker
+                .filter(|marker| *marker > start_ms)
+                .unwrap_or_else(|| start_ms.saturating_add(SIMPMUSIC_LAST_WORD_MS));
+            syllables[index].end_ms = end_ms.max(start_ms);
+        }
+    }
+
+    let text = syllables
+        .iter()
+        .map(|syllable| format!("{}{}", syllable.text, syllable.tail))
+        .collect::<String>();
+    (normalize_lyric_text(&text), syllables)
+}
+
+/// Finds `<mm:ss.xx>` and `[mm:ss.xx]` word markers in a rich-sync body. A
+/// bracket that is not a timestamp (a section label, for example) is left as
+/// literal text, and a nested marker inside such a bracket is still found.
+fn simpmusic_markers(body: &str) -> Vec<(usize, usize, u64)> {
+    let indices = body.char_indices().collect::<Vec<_>>();
+    let mut markers = Vec::new();
+    let mut position = 0;
+
+    while position < indices.len() {
+        let (start, character) = indices[position];
+        let close_character = match character {
+            '<' => '>',
+            '[' => ']',
+            _ => {
+                position += 1;
+                continue;
+            }
+        };
+        let close = indices[position + 1..]
+            .iter()
+            .find(|(_, candidate)| *candidate == close_character)
+            .map(|(index, _)| *index);
+        if let Some(close) = close {
+            let tag = &body[start + character.len_utf8()..close];
+            if let Some(timestamp) = parse_lrc_timestamp(tag) {
+                let next = close + close_character.len_utf8();
+                markers.push((start, next, timestamp));
+                position = indices.partition_point(|entry| entry.0 < next);
+                continue;
+            }
+        }
+        position += 1;
+    }
+
+    markers
+}
+
+/// Splits the leading `[timestamp]` and `[section]` tags from an LRC line.
+/// Metadata tags are ignored, while a bracketed word that is not a known section
+/// stays in the body so it can still be sung.
+fn split_lrc_tags(line: &str) -> (Vec<u64>, &str) {
+    let mut timestamps = Vec::new();
+    let mut rest = line.trim_start();
+
+    while let Some(after_open) = rest.strip_prefix('[') {
+        let Some(close) = after_open.find(']') else {
+            break;
+        };
+        let tag = &after_open[..close];
+        if let Some(timestamp) = parse_lrc_timestamp(tag) {
+            timestamps.push(timestamp);
+            rest = after_open[close + 1..].trim_start();
+            continue;
+        }
+        if is_section_tag(tag) || is_metadata_tag(tag) {
+            rest = after_open[close + 1..].trim_start();
+            continue;
+        }
+        break;
+    }
+
+    (timestamps, rest)
+}
+
+fn simpmusic_offset(document: &str) -> i64 {
+    let mut offset_ms = 0;
+    for line in document.lines() {
+        let mut rest = line.trim_start();
+        while let Some(after_open) = rest.strip_prefix('[') {
+            let Some(close) = after_open.find(']') else {
+                break;
+            };
+            if let Some(offset) = parse_offset_tag(&after_open[..close]) {
+                offset_ms = offset;
+            }
+            rest = after_open[close + 1..].trim_start();
+        }
+    }
+    offset_ms
+}
+
+fn parse_offset_tag(tag: &str) -> Option<i64> {
+    let (key, value) = tag.split_once(':')?;
+    if !key.trim().eq_ignore_ascii_case("offset") {
+        return None;
+    }
+    let seconds = value.trim().parse::<f64>().ok()?;
+    if !seconds.is_finite() {
+        return None;
+    }
+    Some((seconds * 1_000.0).round() as i64)
+}
+
+fn parse_lrc_timestamp(value: &str) -> Option<u64> {
+    let (minutes, seconds) = value.trim().split_once(':')?;
+    let minutes = minutes.trim().parse::<u64>().ok()?;
+    let seconds = seconds.trim().parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    minutes
+        .checked_mul(60_000)?
+        .checked_add((seconds * 1_000.0).round() as u64)
+}
+
+fn adjust_simpmusic_time(milliseconds: u64, offset_ms: i64) -> u64 {
+    (i128::from(milliseconds) + i128::from(offset_ms)).clamp(0, i128::from(u64::MAX)) as u64
+}
+
+fn parse_simpmusic_plain(document: &str) -> Option<Vec<LyricLine>> {
+    let lines = document
+        .lines()
+        .map(|line| normalize_lyric_text(&decode_html_entities(line)))
+        .filter(|line| !is_break_marker(line) && !is_section_label(line))
+        .map(|text| LyricLine {
+            text,
+            start_ms: None,
+            end_ms: None,
+            syllables: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn normalize_lyric_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_html_entities(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while let Some(index) = rest.find('&') {
+        decoded.push_str(&rest[..index]);
+        let after = &rest[index + 1..];
+        let Some(semicolon) = after.find(';') else {
+            decoded.push('&');
+            rest = after;
+            continue;
+        };
+        let entity = &after[..semicolon];
+        if let Some(character) = decode_html_entity(entity) {
+            decoded.push(character);
+            rest = &after[semicolon + 1..];
+        } else {
+            decoded.push('&');
+            rest = after;
+        }
+    }
+    decoded.push_str(rest);
+    decoded
+}
+
+fn decode_html_entity(entity: &str) -> Option<char> {
+    if let Some(hex) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        return u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .filter(|character| *character != '\0');
+    }
+    if let Some(decimal) = entity.strip_prefix('#') {
+        return decimal
+            .parse::<u32>()
+            .ok()
+            .and_then(char::from_u32)
+            .filter(|character| *character != '\0');
+    }
+    match entity.to_ascii_lowercase().as_str() {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "hellip" => Some('…'),
+        "ndash" => Some('–'),
+        "mdash" => Some('—'),
+        "lsquo" => Some('‘'),
+        "rsquo" => Some('’'),
+        "ldquo" => Some('“'),
+        "rdquo" => Some('”'),
+        "copy" => Some('©'),
+        "reg" => Some('®'),
+        "trade" => Some('™'),
+        _ => None,
+    }
+}
+
+fn is_break_marker(text: &str) -> bool {
+    text.chars()
+        .all(|character| character.is_whitespace() || matches!(character, '♪' | '♫'))
+}
+
+fn is_section_label(text: &str) -> bool {
+    let trimmed = text.trim().trim_end_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '♪' | '♫')
+    });
+    trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some_and(is_section_name)
+}
+
+fn is_section_tag(tag: &str) -> bool {
+    is_section_name(tag)
+}
+
+fn is_metadata_tag(tag: &str) -> bool {
+    let Some((key, _)) = tag.split_once(':') else {
+        return false;
+    };
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "ti" | "ar" | "al" | "au" | "by" | "offset" | "length" | "re" | "ve" | "tool" | "encoding"
+    )
+}
+
+fn is_section_name(inner: &str) -> bool {
+    let inner = inner.trim().trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '♪' | '♫')
+    });
+    if inner.is_empty() {
+        return true;
+    }
+
+    let lower = inner.to_ascii_lowercase();
+    if lower == "music" || lower.starts_with("music ") || lower.starts_with("instrumental") {
+        return true;
+    }
+    let base = lower
+        .split([':', '|'])
+        .next()
+        .unwrap_or("")
+        .split(" - ")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(|character: char| {
+            character.is_ascii_digit() || character.is_whitespace()
+        });
+
+    matches!(
+        base,
+        "music"
+            | "intro"
+            | "outro"
+            | "verse"
+            | "pre-chorus"
+            | "prechorus"
+            | "post-chorus"
+            | "postchorus"
+            | "chorus"
+            | "bridge"
+            | "hook"
+            | "refrain"
+            | "interlude"
+            | "solo"
+            | "guitar solo"
+            | "break"
+            | "breakdown"
+            | "skit"
+            | "spoken"
+            | "spoken word"
+            | "ad-lib"
+            | "adlib"
+            | "ad libs"
+            | "adlibs"
+            | "background"
+            | "background vocals"
+            | "backing vocals"
+            | "vocals"
+            | "bg"
+            | "duet"
+            | "male"
+            | "female"
+            | "v1"
+            | "v2"
+            | "v3"
+            | "applause"
+            | "laughs"
+            | "laughter"
+            | "fade out"
+            | "fadeout"
+            | "end"
+    )
+}
+
+fn valid_youtube_video_id(value: &str) -> bool {
+    value.len() == 11
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Parses Luna's KRC payload. Each line is `[start,duration]` followed by
+/// `<offset,duration,?>text` segments; the offsets are relative to the line.
+fn parse_krc(document: &str) -> Option<Vec<LyricLine>> {
+    let mut lines = Vec::new();
+    for raw_line in document.lines() {
+        let raw_line = raw_line.trim();
+        let Some(rest) = raw_line.strip_prefix('[') else {
+            continue;
+        };
+        let Some((header, content)) = rest.split_once(']') else {
+            continue;
+        };
+        let Some((start, duration)) = header.split_once(',') else {
+            continue;
+        };
+        let Ok(start_ms) = start.trim().parse::<u64>() else {
+            continue;
+        };
+        let Ok(duration_ms) = duration.trim().parse::<u64>() else {
+            continue;
+        };
+        let line_end = start_ms.saturating_add(duration_ms);
+
+        let mut segments = Vec::new();
+        let mut remaining = content;
+        while let Some(open) = remaining.find('<') {
+            let after_open = &remaining[open + 1..];
+            let Some(close) = after_open.find('>') else {
+                break;
+            };
+            let header = &after_open[..close];
+            let after = &after_open[close + 1..];
+            let next = after.find('<').unwrap_or(after.len());
+            if let Some(offset) = header
+                .split(',')
+                .next()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            {
+                segments.push((offset, &after[..next]));
+            }
+            remaining = &after[next..];
+        }
+
+        let mut syllables: Vec<LyricSyllable> = Vec::new();
+        let mut full = String::new();
+        for (index, (offset, raw_text)) in segments.iter().enumerate() {
+            let text = raw_text.trim();
+            if text.is_empty() {
+                if let Some(last) = syllables.last_mut()
+                    && !last.tail.ends_with(' ')
+                {
+                    last.tail.push(' ');
+                }
+                continue;
+            }
+            let start = start_ms.saturating_add(*offset);
+            let end = segments
+                .get(index + 1)
+                .map(|(next, _)| start_ms.saturating_add(*next))
+                .unwrap_or(line_end);
+            let tail = if raw_text.ends_with(char::is_whitespace) {
+                " "
+            } else {
+                ""
+            };
+            syllables.push(LyricSyllable {
+                text: text.to_owned(),
+                tail: tail.to_owned(),
+                start_ms: start,
+                end_ms: end.max(start),
+            });
+            full.push_str(text);
+            full.push_str(tail);
+        }
+
+        let text = if syllables.is_empty() {
+            content.trim().to_owned()
+        } else {
+            full.trim().to_owned()
+        };
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(LyricLine {
+            text,
+            start_ms: Some(start_ms),
+            end_ms: Some(line_end.max(start_ms)),
+            syllables,
+        });
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort_by_key(|line| line.start_ms.unwrap_or(0));
+    let last_index = lines.len() - 1;
+    for index in 0..lines.len() {
+        let start = lines[index].start_ms.unwrap_or(0);
+        if lines[index].end_ms.unwrap_or(start) <= start {
+            lines[index].end_ms = Some(
+                lines
+                    .get(index + 1)
+                    .and_then(|line| line.start_ms)
+                    .or_else(|| (index == last_index).then_some(start.saturating_add(5_000)))
+                    .unwrap_or(start),
+            );
+        }
+    }
+    Some(lines)
+}
+
+fn parse_plain_lyrics(document: &str) -> Option<Vec<LyricLine>> {
+    let lines = document
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "♪")
+        .map(|text| LyricLine {
+            text: text.to_owned(),
+            start_ms: None,
+            end_ms: None,
+            syllables: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn strip_leading_credits_from_lines(lines: &mut Vec<LyricLine>, terms: &SearchTerms) {
+    // Plain lyrics carry no timing, so there is no safe way to tell a short
+    // opening lyric from a bare credit name.
+    if lines.iter().all(|line| line.start_ms.is_none()) {
+        return;
+    }
+
+    const MAX_CREDIT_LINES: usize = 24;
+    let mut dropped = 0;
+    while dropped < lines.len() && dropped < MAX_CREDIT_LINES {
+        let next_start_ms = lines.get(dropped + 1).and_then(|line| line.start_ms);
+        let line = &lines[dropped];
+        let start_ms = line.start_ms.unwrap_or(0);
+        let end_ms = line.end_ms.unwrap_or(start_ms);
+        if !is_credit_line(&line.text, terms, start_ms, end_ms, next_start_ms) {
+            break;
+        }
+        dropped += 1;
+    }
+    if dropped < lines.len() {
+        lines.drain(..dropped);
+    }
+}
+
+fn luna_songwriters(seo_track: Option<LunaSeoTrack>) -> Vec<String> {
+    let Some(team) = seo_track
+        .and_then(|seo_track| seo_track.track)
+        .and_then(|track| track.song_maker_team)
+    else {
+        return Vec::new();
+    };
+
+    let mut songwriters = Vec::new();
+    for credit in team.composers.into_iter().chain(team.lyricists) {
+        let name = credit.name.trim();
+        if !name.is_empty() && !songwriters.iter().any(|existing| existing == name) {
+            songwriters.push(name.to_owned());
+        }
+    }
+    songwriters
+}
+
 fn parse_lrc(document: &str) -> Option<Vec<LyricLine>> {
     let mut timed = document
         .lines()
@@ -1695,10 +2773,12 @@ fn parse_number(value: &str, original: &str) -> Result<f64, TtmlError> {
 mod tests {
     use super::{
         BiniLyricsResult, KpoeLine, KpoeMetadata, KpoeResponse, KpoeSyllable, LrcLibResponse,
-        LrcLibSearchResult, Lyrics, LyricsClient, LyricsTiming, LyricsTrack, SearchTerms,
-        UnisonData, UnisonResponse, allowed_provider_url, best_bini_match, best_lrclib_match,
-        clean_artist, clean_title, match_score, parse_kpoe, parse_lrclib, parse_unison, tokens,
-        unison_sync_timing,
+        LrcLibSearchResult, LunaDetailResponse, LunaSearchResponse, Lyrics, LyricsClient,
+        LyricsTiming, LyricsTrack, SearchTerms, SimpMusicResponse, UnisonData, UnisonResponse,
+        allowed_provider_url, best_bini_match, best_lrclib_match, clean_artist, clean_title,
+        decode_html_entities, luna_candidates, match_score, parse_kpoe, parse_krc, parse_lrclib,
+        parse_luna, parse_simpmusic, parse_unison, titles_differ_by_one_edit, tokens,
+        unison_sync_timing, valid_youtube_video_id,
     };
 
     fn track(title: &str, artist: &str, duration: Option<u64>) -> LyricsTrack {
@@ -2095,6 +3175,85 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live lyrics provider compatibility probe"]
+    async fn loads_luna_word_synced_lyrics() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch_luna(&LyricsTrack {
+                title: "Nothin' On You".to_owned(),
+                artist: "B.o.B".to_owned(),
+                album: None,
+                duration_seconds: Some(230),
+                video_id: None,
+            })
+            .await
+            .unwrap()
+            .expect("Luna carries the original Nothing On You");
+
+        assert_eq!(lyrics.source, "Luna");
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert!(
+            lyrics.lines[0].text.contains("Beautiful girls"),
+            "unexpected first line: {:?}",
+            lyrics.lines[0].text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
+    async fn loads_luna_lyrics_for_a_chinese_track() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch_luna(&LyricsTrack {
+                title: "起风了".to_owned(),
+                artist: "买辣椒也用券".to_owned(),
+                album: None,
+                duration_seconds: Some(325),
+                video_id: None,
+            })
+            .await
+            .unwrap()
+            .expect("Luna carries the original 起风了");
+
+        assert_eq!(lyrics.source, "Luna");
+        assert!(lyrics.timing > LyricsTiming::Plain);
+        assert!(!lyrics.lines.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
+    async fn loads_simpmusic_word_synced_lyrics() {
+        let lyrics = LyricsClient::new()
+            .unwrap()
+            .fetch_simpmusic(&LyricsTrack {
+                title: "Nothin' On You".to_owned(),
+                artist: "B.o.B".to_owned(),
+                album: None,
+                duration_seconds: Some(230),
+                video_id: Some("8PTDv_szmL0".to_owned()),
+            })
+            .await
+            .unwrap()
+            .expect("SimpMusic carries the exact video's rich sync");
+
+        assert_eq!(lyrics.source, "SimpMusic");
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(lyrics.lines[0].text, "Beautiful girls all over the world");
+        assert!(
+            lyrics
+                .lines
+                .iter()
+                .any(|line| line.text.contains("Nothin' on you, ba by, yeah")),
+            "unexpected lines: {:?}",
+            lyrics
+                .lines
+                .iter()
+                .map(|line| &line.text)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live lyrics provider compatibility probe"]
     async fn loads_synced_lyrics_for_a_placeholder_artist() {
         let lyrics = LyricsClient::new()
             .unwrap()
@@ -2369,6 +3528,328 @@ mod tests {
     fn still_matches_a_version_the_target_does_ask_for() {
         let terms = SearchTerms::from_track(&track("Nothin' on You (Live)", "B.o.B", Some(237)));
         assert!(match_score(&terms, "Nothin' On You (Live)", "B.o.B", Some(237.0)).is_some());
+    }
+
+    #[test]
+    fn matches_elided_title_variants_without_loosening_artist_matching() {
+        let terms = SearchTerms::from_track(&track("Nothin' On You", "B.o.B", Some(263)));
+        assert!(
+            match_score(&terms, "Nothing On You", "Bruno Mars, B.o.B", Some(255.0)).is_some(),
+            "providers spell elided titles differently"
+        );
+        assert!(
+            match_score(&terms, "Nothing On You", "Some Cover Band", Some(255.0)).is_none(),
+            "a fuzzy title still needs the right artist"
+        );
+        assert!(titles_differ_by_one_edit("nothinonyou", "nothingonyou"));
+        assert!(!titles_differ_by_one_edit("sing", "sin"));
+    }
+
+    #[test]
+    fn parses_krc_word_and_cjk_timings() {
+        let lines = parse_krc(
+            "[20,2020]<0,350,0>Beautiful <880,1140,0>girls\n\
+             [2040,1450]<0,250,0>All <340,270,0>over <860,270,0>the <1180,270,0>world",
+        )
+        .unwrap();
+
+        assert_eq!(lines[0].text, "Beautiful girls");
+        assert_eq!(lines[0].start_ms, Some(20));
+        assert_eq!(lines[0].end_ms, Some(2040));
+        assert_eq!(lines[0].syllables.len(), 2);
+        assert_eq!(lines[0].syllables[0].text, "Beautiful");
+        assert_eq!(lines[0].syllables[0].tail, " ");
+        assert_eq!(lines[0].syllables[0].start_ms, 20);
+        assert_eq!(lines[0].syllables[0].end_ms, 900);
+        assert_eq!(lines[0].syllables[1].start_ms, 900);
+        assert_eq!(lines[0].syllables[1].end_ms, 2040);
+
+        let cjk =
+            parse_krc("[332,1536]<0,296,0>写<320,296,0>一<640,288,0>个<928,288,0>剧<1240,296,0>本")
+                .unwrap();
+        assert_eq!(cjk[0].text, "写一个剧本");
+        assert_eq!(cjk[0].syllables.len(), 5);
+        assert_eq!(cjk[0].syllables[1].start_ms, 652);
+        assert_eq!(cjk[0].syllables[4].end_ms, 1868);
+    }
+
+    #[test]
+    fn parses_luna_krc_and_songwriters() {
+        let terms = SearchTerms::from_track(&track("Nothin' On You", "B.o.B", Some(263)));
+        let response: LunaDetailResponse = serde_json::from_str(
+            r#"{
+                "lyric": {
+                    "content": "[20,2020]<0,350,0>Beautiful <880,1140,0>girls",
+                    "type": "krc"
+                },
+                "seo_track": {
+                    "track": {
+                        "song_maker_team": {
+                            "composers": [{"name": "Bruno Mars"}],
+                            "lyricists": [{"name": "Philip Lawrence"}, {"name": "Bruno Mars"}]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_luna(response, &terms).unwrap();
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(lyrics.source, "Luna");
+        assert_eq!(lyrics.lines[0].text, "Beautiful girls");
+        assert_eq!(lyrics.songwriters, ["Bruno Mars", "Philip Lawrence"]);
+    }
+
+    #[test]
+    fn parses_luna_lrc_fallback() {
+        let terms = SearchTerms::from_track(&track("Nothin' On You", "B.o.B", Some(263)));
+        let response: LunaDetailResponse = serde_json::from_str(
+            r#"{
+                "lyric": {
+                    "content": "[00:01.00]First\n[00:02.00]Second",
+                    "type": "lrc"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_luna(response, &terms).unwrap();
+        assert_eq!(lyrics.timing, LyricsTiming::LineSynced);
+        assert_eq!(lyrics.lines[0].text, "First");
+        assert_eq!(lyrics.lines[0].end_ms, Some(2_000));
+    }
+
+    #[test]
+    fn ranks_luna_originals_and_rejects_cover_candidates() {
+        let terms = SearchTerms::from_track(&track("Nothin' On You", "B.o.B", Some(263)));
+        let response: LunaSearchResponse = serde_json::from_str(
+            r#"{
+                "result_groups": [{
+                    "data": [
+                        {
+                            "entity": {"track": {
+                                "id": "cover",
+                                "name": "Nothin' On You (Cover)",
+                                "artists": [{"name": "Plusmusic"}],
+                                "duration": 302000
+                            }}
+                        },
+                        {
+                            "entity": {"track": {
+                                "id": "original",
+                                "name": "Nothing On You",
+                                "artists": [{"name": "Bruno Mars"}, {"name": "B.o.B"}],
+                                "duration": 255295,
+                                "label_info": {"is_original": true}
+                            }}
+                        }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let candidates = luna_candidates(&terms, response);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "original");
+    }
+
+    #[test]
+    fn strips_luna_credits_before_timed_lyrics() {
+        let terms = SearchTerms::from_track(&track("Superheroes", "The Script", Some(250)));
+        let response: LunaDetailResponse = serde_json::from_str(
+            r#"{
+                "lyric": {
+                    "content": "[9070,2475]James Barry\n[23118,2628]All her life she has seen",
+                    "type": "krc"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_luna(response, &terms).unwrap();
+        assert_eq!(lyrics.lines[0].text, "All her life she has seen");
+        assert_eq!(lyrics.lines[0].start_ms, Some(23_118));
+    }
+
+    #[test]
+    fn parses_simpmusic_rich_sync_with_overlapping_words() {
+        let response: SimpMusicResponse = serde_json::from_str(
+            r#"{
+                "success": true,
+                "data": [{
+                    "vote": 5,
+                    "contributor": "alice",
+                    "richSyncLyrics": "[offset:-0.196136956521738]\n[00:04.59] <00:04.59>Beautiful <00:05.47>girls <00:06.59>all <00:06.94>over <00:07.49>the <00:07.80>world\n[00:36.86] <00:36.86>Nothin&#x27; <00:37.49>on <00:37.83>you, <00:38.89>ba <00:39.55>by, <00:41.30>yeah <00:38.36>(No- <00:38.72>no- <00:39.00>no- <00:39.30>nothin&#x27; <00:39.58>on <00:39.87>you, <00:40.15>babe)",
+                    "syncedLyrics": "[00:01.00]Wrong",
+                    "plainLyric": "Wrong"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_simpmusic(response).unwrap();
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(lyrics.source, "SimpMusic (submitted by alice)");
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[0].text, "Beautiful girls all over the world");
+        assert_eq!(lyrics.lines[0].start_ms, Some(4_394));
+        assert_eq!(lyrics.lines[0].end_ms, Some(8_404));
+        assert_eq!(lyrics.lines[0].syllables[0].text, "Beautiful");
+        assert_eq!(lyrics.lines[0].syllables[0].tail, " ");
+        assert_eq!(lyrics.lines[0].syllables[0].start_ms, 4_394);
+        assert_eq!(lyrics.lines[0].syllables[0].end_ms, 5_274);
+
+        let overlapping = &lyrics.lines[1];
+        assert_eq!(overlapping.start_ms, Some(36_664));
+        assert_eq!(overlapping.end_ms, Some(41_104));
+        assert!(overlapping.text.contains("Nothin' on you, ba by, yeah"));
+        assert!(
+            overlapping
+                .text
+                .contains("(No- no- no- nothin' on you, babe)")
+        );
+        let yeah = overlapping
+            .syllables
+            .iter()
+            .find(|syllable| syllable.text == "yeah")
+            .unwrap();
+        assert_eq!(yeah.start_ms, 41_104);
+        assert_eq!(
+            yeah.end_ms, 41_104,
+            "an out-of-order word must not lose its own highlight window"
+        );
+        assert!(
+            overlapping
+                .syllables
+                .windows(2)
+                .any(|pair| pair[1].start_ms < pair[0].start_ms),
+            "overlapping backing vocals keep their own timestamps"
+        );
+    }
+
+    #[test]
+    fn parses_simpmusic_lrc_with_offset_and_section_markers() {
+        let response: SimpMusicResponse = serde_json::from_str(
+            r#"{
+                "success": true,
+                "data": [{
+                    "vote": 1,
+                    "syncedLyrics": "[offset:-0.25]\n[ti:Song]\n[00:01.00][Music]\n[00:02.50] First &amp; second\n[00:05.00] It&#x27;s &quot;fine&quot;\n[00:07.00] ♪\n[00:08.00][Chorus] Last"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_simpmusic(response).unwrap();
+        assert_eq!(lyrics.timing, LyricsTiming::LineSynced);
+        assert_eq!(lyrics.source, "SimpMusic");
+        assert_eq!(lyrics.lines.len(), 3);
+        assert_eq!(lyrics.lines[0].text, "First & second");
+        assert_eq!(lyrics.lines[0].start_ms, Some(2_250));
+        assert_eq!(lyrics.lines[0].end_ms, Some(4_750));
+        assert_eq!(lyrics.lines[1].text, "It's \"fine\"");
+        assert_eq!(lyrics.lines[1].start_ms, Some(4_750));
+        assert_eq!(lyrics.lines[2].text, "Last");
+        assert_eq!(lyrics.lines[2].start_ms, Some(7_750));
+        assert_eq!(lyrics.lines[2].end_ms, Some(12_750));
+    }
+
+    #[test]
+    fn prefers_the_highest_voted_simpmusic_entry() {
+        let response: SimpMusicResponse = serde_json::from_str(
+            r#"{
+                "success": true,
+                "data": [
+                    {"vote": 1, "richSyncLyrics": "[00:01.00] <00:01.00>Low"},
+                    {"vote": 9, "plainLyric": "High\n[Music]\nStill high"},
+                    {"vote": 5, "syncedLyrics": "[00:01.00]Mid"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_simpmusic(response).unwrap();
+        assert_eq!(lyrics.timing, LyricsTiming::Plain);
+        assert_eq!(lyrics.source, "SimpMusic");
+        assert_eq!(
+            lyrics
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["High", "Still high"]
+        );
+    }
+
+    #[test]
+    fn prefers_rich_sync_over_synced_and_plain_within_a_simpmusic_entry() {
+        let response: SimpMusicResponse = serde_json::from_str(
+            r#"{
+                "success": true,
+                "data": [{
+                    "vote": 3,
+                    "richSyncLyrics": "[00:01.00] <00:01.00>Rich <00:02.00>sync",
+                    "syncedLyrics": "[00:01.00]Synced",
+                    "plainLyric": "Plain"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_simpmusic(response).unwrap();
+        assert_eq!(lyrics.timing, LyricsTiming::SyllableSynced);
+        assert_eq!(lyrics.lines[0].text, "Rich sync");
+        assert_eq!(lyrics.lines[0].syllables.len(), 2);
+    }
+
+    #[test]
+    fn falls_back_to_simpmusic_plain_lyrics() {
+        let response: SimpMusicResponse = serde_json::from_str(
+            r#"{
+                "success": true,
+                "data": [{
+                    "vote": 1,
+                    "richSyncLyrics": "[00:01.00][Music]",
+                    "syncedLyrics": "[00:01.00][Chorus]",
+                    "plainLyric": "Line one\n[Music]\nLine &amp; two"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let lyrics = parse_simpmusic(response).unwrap();
+        assert_eq!(lyrics.timing, LyricsTiming::Plain);
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[0].text, "Line one");
+        assert_eq!(lyrics.lines[1].text, "Line & two");
+    }
+
+    #[test]
+    fn decodes_simpmusic_html_entities_without_touching_unknown_text() {
+        assert_eq!(
+            decode_html_entities("&#x27;Cause &amp; &quot;effect&quot; &#39;"),
+            "'Cause & \"effect\" '"
+        );
+        assert_eq!(decode_html_entities("&unknown; &amp"), "&unknown; &amp");
+    }
+
+    #[test]
+    fn validates_simpmusic_video_ids_and_host() {
+        assert!(valid_youtube_video_id("8PTDv_szmL0"));
+        assert!(!valid_youtube_video_id(""));
+        assert!(!valid_youtube_video_id("short"));
+        assert!(!valid_youtube_video_id("8PTDv_szmL0/../x"));
+        assert!(allowed_provider_url(
+            &reqwest::Url::parse("https://api-lyrics.simpmusic.org/v1/8PTDv_szmL0").unwrap()
+        ));
+        assert!(!allowed_provider_url(
+            &reqwest::Url::parse(
+                "https://api-lyrics.simpmusic.org.attacker.example/v1/8PTDv_szmL0"
+            )
+            .unwrap()
+        ));
     }
 
     #[test]
